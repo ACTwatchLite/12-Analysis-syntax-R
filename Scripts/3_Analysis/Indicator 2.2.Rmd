@@ -1,0 +1,831 @@
+---
+title: "ACTwatch Indicator 2.2 - Availability of Antimalarials Among Antimalarial-Stocking Outlets"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output: 
+  word_document:
+    toc: false
+    toc_depth: 2
+    reference_docx: null
+---
+
+## Indicator Definition
+
+**Indicator Group:** Availability among antimalarial-stocking outlets
+
+**Description:** The proportion of antimalarial-stocking outlets with specific antimalarial products in stock on the day of the survey visit, disaggregated by antimalarial type and outlet type
+
+**Numerator:** Number of antimalarial-stocking outlets with a specific antimalarial product/category in stock
+
+**Denominator:** Total number of antimalarial-stocking outlets of a given type
+
+**Disaggregation:** By antimalarial type and outlet type; additional disaggregation by strata if available
+
+**Data Source:** Outlet data
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, 
+                      fig.width = 12, fig.height = 8)
+
+library(tidyverse)
+library(survey)
+library(openxlsx)
+library(forcats)
+library(here)
+library(data.table)
+
+# Set parameters
+if (!exists("country")) stop("Global variable 'country' not found")
+if (!exists("year")) stop("Global variable 'year' not found") 
+
+# Configuration matching the Stata analysis structure
+indicator_config <- list(
+  indicator_id = "2.2",
+  title = "Availability of Antimalarials Among Antimalarial-Stocking Outlets",
+  description = "Proportion of antimalarial-stocking outlets with antimalarial products in stock by type",
+  
+  # Analysis settings
+  dataset = "outlet",
+  analysis_type = "availability",
+  survey_weight = "wt_alloutlet", # Standard outlet weight for availability analysis
+  population_filter = quote(st_anyam == 1), # Only antimalarial-stocking outlets
+  
+  # Outlet types (matching Stata .do file)
+  outlet_dummies = c("private_nonprofit", "private_forprofit", "pharmacy",
+                    "laboratory",  "drug_store", "total_informal", "total_retail", "wholesale"),
+  outlet_labels = list(
+    "private_nonprofit" = "Private Not-for-Profit",
+    "private_forprofit" = "Private For-Profit", 
+    "pharmacy" = "Pharmacy",
+    "laboratory" = "Laboratory",
+    "drug_store" = "Drug Store",
+    "total_informal" = "Informal (Total)",
+    "total_retail" = "Retail (Total)",
+    "wholesale" = "Wholesaler"
+  ),
+
+  # Antimalarial product variables (from Stata local definitions - lowercase)
+  antimalarial_vars = c(
+    "st_anyam",           # Any antimalarial
+    "st_anyact",          # Any ACT
+    "st_al",              # Artemether lumefantrine
+    "st_asaq",            # Artesunate amodiaquine
+    "st_appq",            # Artemisinin piperaquine
+    "st_dhappq",          # Dihydroartemisinin piperaquine
+    "st_arppq",           # Arterolane piperaquine
+    "st_otheract",        # Any other ACT
+    "st_natapp",          # Nationally approved ACT
+    "st_qaact",           # QA ACT
+    "st_qa_all",          # WHO PQ and nationally approved
+    "st_qa_who",          # WHO PQ but not nationally approved
+    "st_qa_nat",          # Nationally approved but not WHO PQ
+    "st_qa_none",         # Not QA or nationally approved
+    "st_2act",            # Two or more ACTs
+    "st_nonart",          # Non-artemisinins
+    "st_oralqn",          # Oral quinine
+    "st_cq",              # Chloroquine
+    "st_sp",              # Sulfadoxine pyrimethamine
+    "st_spaq",            # Sulfadoxine pyrimethamine amodiaquine
+    "st_nonartoth",       # Other non-artemisinins
+    "st_oartmono",        # Oral artemisinin monotherapy
+    "st_noartmono",       # Non-oral artemisinin monotherapy
+    "st_severe",          # Treatment for severe malaria
+    "st_recas",           # Rectal artesunate
+    "st_injas",           # Injectable artesunate
+    "st_injar",           # Injectable artemether
+    "st_injae",           # Injectable arteether
+    "st_injqn"            # Injectable quinine
+  ),
+  
+  # Product labels for better display
+  antimalarial_labels = list(
+    "st_anyam" = "Any antimalarial",
+    "st_anyact" = "Any ACT",
+    "st_al" = "Artemether-lumefantrine",
+    "st_asaq" = "Artesunate-amodiaquine",
+    "st_appq" = "Artemisinin-piperaquine",
+    "st_dhappq" = "Dihydroartemisinin-piperaquine",
+    "st_arppq" = "Arterolane-piperaquine",
+    "st_otheract" = "Any other ACT",
+    "st_natapp" = "Stocks nationally approved ACT",
+    "st_qaact" = "Stocks QA ACT",
+    "st_qa_all" = "ACT that is both WHO PQ and nationally approved",
+    "st_qa_who" = "ACT that is WHO PQ but not nationally approved",
+    "st_qa_nat" = "ACT that is nationally approved but not WHO PQ",
+    "st_qa_none" = "Stocks ACT not QA or nationally approved",
+    "st_2act" = "Two or more ACTs",
+    "st_nonart" = "Non-artemisinins",
+    "st_oralqn" = "Oral quinine",
+    "st_cq" = "Chloroquine",
+    "st_sp" = "Sulfadoxine-pyrimethamine",
+    "st_spaq" = "Sulfadoxine pyrimethamine amodiaquine",
+    "st_nonartoth" = "Other non-artemisinins",
+    "st_oartmono" = "Oral artemisinin monotherapy",
+    "st_noartmono" = "Non-oral artemisinin monotherapy",
+    "st_severe" = "Treatment for severe malaria",
+    "st_recas" = "Rectal artesunate",
+    "st_injas" = "Injectable artesunate",
+    "st_injar" = "Injectable artemether",
+    "st_injae" = "Injectable arteether",
+    "st_injqn" = "Injectable quinine"
+  ),
+  
+  antimalarial_order = c("Any antimalarial", "Any ACT", "Artemether-lumefantrine", "Artesunate-amodiaquine", "Artemisinin-piperaquine", "Dihydroartemisinin-piperaquine", "Arterolane-piperaquine", "Any other ACT", "Stocks nationally approved ACT", "Stocks QA ACT", "ACT that is both WHO PQ and nationally approved", "ACT that is WHO PQ but not nationally approved", "ACT that is nationally approved but not WHO PQ", "Stocks ACT not QA or nationally approved", "Two or more ACTs", "Non-artemisinins", "Oral quinine", "Chloroquine", "Sulfadoxine-pyrimethamine", "Sulfadoxine pyrimethamine amodiaquine", "Other non-artemisinins", "Oral artemisinin monotherapy", "Non-oral artemisinin monotherapy", "Treatment for severe malaria", "Rectal artesunate", "Injectable artesunate", "Injectable artemether", "Injectable arteether", "Injectable quinine"),
+  
+  # ACT types for focused figures (matching Stata comments)
+  act_types = c("st_anyact", "st_al", "st_asaq", "st_appq", "st_dhappq", "st_arppq", "st_otheract"),
+  
+  # Output settings
+  file_suffix = "Availability of antimalarials in antimalarial-stocking outlets"
+)
+```
+
+```{r load_data, include=FALSE}
+# Load outlet data
+data_file <- here("Data", "Final data", 
+                  paste0(country, "_", year, "_outlet_data.csv"))
+
+if (!file.exists(data_file)) {
+  stop("Data file not found: ", data_file)
+}
+
+outlet_data <- fread(data_file) %>%
+  # Ensure strata variables are character
+  mutate(across(any_of(c("strata1", "strata2")), as.character)) %>%
+  # Clean up blank but non-missing strata values
+  mutate(
+    strata1 = dplyr::na_if(strata1, ""),
+    strata2 = dplyr::na_if(strata2, "")
+  ) 
+# %>% 
+#   filter(anyam==1)
+```
+
+
+
+```{r data_processing, include=FALSE}
+# Apply population filter (antimalarial-stocking outlets only)
+processed_data <- outlet_data %>%
+  filter(!!indicator_config$population_filter)
+
+# Detect strata structure
+strata_info <- list()
+if ("strata1" %in% names(processed_data) && 
+    length(unique(na.omit(processed_data$strata1))) > 1) {
+  strata1_values <- unique(na.omit(processed_data$strata1))
+  strata1_values <- strata1_values[strata1_values != "" & !is.na(trimws(strata1_values))]
+  if (length(strata1_values) > 1) {
+    strata_info$strata1 <- list(variable = "strata1", values = strata1_values)
+  }
+}
+
+if ("strata2" %in% names(processed_data) && 
+    length(unique(na.omit(processed_data$strata2))) > 1) {
+  strata2_values <- unique(na.omit(processed_data$strata2))
+  strata2_values <- strata2_values[strata2_values != "" & !is.na(trimws(strata2_values))]
+  if (length(strata2_values) > 1) {
+    strata_info$strata2 <- list(variable = "strata2", values = strata2_values)
+  }
+}
+
+has_strata1 <- "strata1" %in% names(strata_info)
+has_strata2 <- "strata2" %in% names(strata_info)
+cross_strata_possible <- has_strata1 && has_strata2
+```
+
+```{r survey_setup, include=FALSE}
+# Setup survey design (following Stata: svyset c4 [pweight=wt_alloutlet], strata(strata) fpc(fpc))
+survey_design <- processed_data %>%
+  filter(!is.na(!!sym(indicator_config$survey_weight))) %>%
+  as_survey_design(
+    ids = c4,
+    weights = !!sym(indicator_config$survey_weight),
+    strata = strata1,  # Using strata1 as primary design strata
+    fpc = fpc
+  )
+```
+
+```{r analysis_functions, include=FALSE}
+# Calculate availability (proportion of outlets with product in stock)
+calculate_availability <- function(survey_data, group_vars = NULL) {
+  
+  results <- tibble()
+  
+  # Available antimalarial variables in the dataset
+  available_antimalarial_vars <- intersect(indicator_config$antimalarial_vars, 
+                                          names(survey_data$variables))
+  
+  # Available outlet variables in the dataset
+  available_outlet_vars <- intersect(indicator_config$outlet_dummies, 
+                                    names(survey_data$variables))
+  
+  for (antimalarial_var in available_antimalarial_vars) {
+    for (outlet_var in available_outlet_vars) {
+      
+      tryCatch({
+        if (is.null(group_vars)) {
+          # National analysis - availability of antimalarial_var in outlet_var
+          # Count antimalarial-stocking outlets of this type that have this product
+subset_condition <- survey_data$variables[[outlet_var]] == 1 & 
+                   !is.na(survey_data$variables[[outlet_var]])
+          
+          if (sum(subset_condition) > 5) {  # Sufficient observations
+            subset_design <- subset(survey_data, subset_condition)
+            
+            # Calculate proportion with product
+            prop_result <- svyciprop(as.formula(paste0("~", antimalarial_var)), 
+                                    subset_design,
+                                    method = "logit")
+            
+            ci_result <- confint(prop_result, method = "logit")
+            total_result <- svytotal(as.formula(paste0("~", antimalarial_var)), subset_design)
+            
+            result_row <- tibble(
+              antimalarial_type = antimalarial_var,
+              outlet_type = outlet_var,
+              point_estimate = as.numeric(prop_result) * 100,
+              lower_ci = ci_result[1] * 100,
+              upper_ci = ci_result[2] * 100,
+              n_weighted = as.numeric(total_result),
+              sample_size = sum(subset_condition),
+              antimalarial_label = indicator_config$antimalarial_labels[[antimalarial_var]] %||% antimalarial_var,
+              outlet_label = indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+            )
+            
+            results <- bind_rows(results, result_row)
+          } else {
+            # No data available - create row with 0 and missing CIs
+            total_outlets <- sum(survey_data$variables[[outlet_var]] == 1 & 
+                               !is.na(survey_data$variables[[outlet_var]]), na.rm = TRUE)
+            
+            result_row <- tibble(
+              antimalarial_type = antimalarial_var,
+              outlet_type = outlet_var,
+              point_estimate = 0,
+              lower_ci = NA_real_,
+              upper_ci = NA_real_,
+              n_weighted = 0,
+              sample_size = total_outlets,
+              antimalarial_label = indicator_config$antimalarial_labels[[antimalarial_var]] %||% antimalarial_var,
+              outlet_label = indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+            )
+            
+            results <- bind_rows(results, result_row)
+          }
+          
+        } else {
+          # Strata analysis
+          strata_values <- unique(survey_data$variables[[group_vars[1]]])
+          strata_values <- strata_values[!is.na(strata_values)]
+          
+          for (strata_val in strata_values) {
+            subset_condition <- survey_data$variables[[group_vars[1]]] == strata_val & 
+                               survey_data$variables[[outlet_var]] == 1 & 
+                               !is.na(survey_data$variables[[group_vars[1]]]) &
+                               !is.na(survey_data$variables[[outlet_var]]) &
+                               !is.na(survey_data$variables[[antimalarial_var]])
+            
+            if (sum(subset_condition) > 5) {
+              subset_design <- subset(survey_data, subset_condition)
+              
+              prop_result <- svyciprop(as.formula(paste0("~", antimalarial_var)), 
+                                      subset_design,
+                                      method = "logit")
+              
+              ci_result <- confint(prop_result, method = "logit")
+              total_result <- svytotal(as.formula(paste0("~", antimalarial_var)), subset_design)
+              
+              result_row <- tibble(
+                antimalarial_type = antimalarial_var,
+                outlet_type = outlet_var,
+                point_estimate = as.numeric(prop_result) * 100,
+                lower_ci = ci_result[1] * 100,
+                upper_ci = ci_result[2] * 100,
+                n_weighted = as.numeric(total_result),
+                sample_size = sum(subset_condition),
+                antimalarial_label = indicator_config$antimalarial_labels[[antimalarial_var]] %||% antimalarial_var,
+                outlet_label = indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+              )
+              
+              result_row[[group_vars[1]]] <- as.character(strata_val)
+              results <- bind_rows(results, result_row)
+            } else {
+              # No data - create 0 row
+              total_outlets <- sum(survey_data$variables[[group_vars[1]]] == strata_val & 
+                                 survey_data$variables[[outlet_var]] == 1 &
+                                 !is.na(survey_data$variables[[group_vars[1]]]) &
+                                 !is.na(survey_data$variables[[outlet_var]]), na.rm = TRUE)
+              
+              result_row <- tibble(
+                antimalarial_type = antimalarial_var,
+                outlet_type = outlet_var,
+                point_estimate = 0,
+                lower_ci = NA_real_,
+                upper_ci = NA_real_,
+                n_weighted = 0,
+                sample_size = total_outlets,
+                antimalarial_label = indicator_config$antimalarial_labels[[antimalarial_var]] %||% antimalarial_var,
+                outlet_label = indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+              )
+              
+              result_row[[group_vars[1]]] <- as.character(strata_val)
+              results <- bind_rows(results, result_row)
+            }
+          }
+        }
+        
+      }, error = function(e) {
+        message("Error processing ", antimalarial_var, " in ", outlet_var, ": ", e$message)
+      })
+    }
+  }
+  
+  return(results)
+}
+
+# Calculate footnotes (outlets that incomplete interview)
+calculate_footnotes <- function(data, strata1_var = NULL, strata2_var = NULL) {
+  
+  # Outlets that incomplete interview based on Stata criteria
+  incomplete_criteria <- c(203,204,205,207,208,303,304,305,307,308,309,310)
+  
+  # Count by outlet type
+  outlet_counts <- tibble()
+  available_outlet_vars <- intersect(indicator_config$outlet_dummies, names(data))
+  
+  for (outlet_var in available_outlet_vars) {
+    outlet_label <- indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+    
+    if (is.null(strata1_var)) {
+      # National counts - antimalarial-stocking outlets
+      anyam_count <- sum(data[[outlet_var]] == 1 & data$anyam == 1, na.rm = TRUE)
+      incomplete_count <- sum(data[[outlet_var]] == 1 & data$anyam == 1 & 
+                         data$finalintstat %in% incomplete_criteria, na.rm = TRUE)
+      
+      outlet_counts <- bind_rows(outlet_counts, tibble(
+        outlet_type = outlet_var,
+        outlet_label = outlet_label,
+        anyam_outlets = anyam_count,
+        incomplete = incomplete_count
+      ))
+    } else {
+      # Strata counts
+      strata_levels <- unique(data[[strata1_var]])
+      strata_levels <- strata_levels[!is.na(strata_levels)]
+      
+      for (strata_val in strata_levels) {
+        anyam_count <- sum(data[[outlet_var]] == 1 & data$anyam == 1 & 
+                             data[[strata1_var]] == strata_val, na.rm = TRUE)
+        incomplete_count <- sum(data[[outlet_var]] == 1 & data$anyam == 1 & 
+                           data[[strata1_var]] == strata_val &
+                           data$finalintstat %in% incomplete_criteria, na.rm = TRUE)
+        
+        outlet_counts <- bind_rows(outlet_counts, tibble(
+          outlet_type = outlet_var,
+          outlet_label = outlet_label,
+          strata = strata_val,
+          anyam_outlets = anyam_count,
+          incomplete = incomplete_count
+        ))
+      }
+    }
+  }
+  
+  # Format footnote
+  if (is.null(strata1_var)) {
+    anyam_text <- paste0(outlet_counts$outlet_label, "=", outlet_counts$anyam_outlets, collapse = "; ")
+    incomplete_text <- paste0("Incomplete interviews = ", sum(outlet_counts$incomplete))
+    return(paste0("N antimalarial-stocking outlets: ", anyam_text, ". ", incomplete_text))
+  } else {
+    # For strata, return a list of footnotes
+    footnotes <- list()
+    strata_levels <- unique(outlet_counts$strata)
+    
+    for (strata_val in strata_levels) {
+      strata_data <- outlet_counts %>% filter(strata == strata_val)
+      anyam_text <- paste0(strata_data$outlet_label, "=", strata_data$anyam_outlets, collapse = "; ")
+      incomplete_text <- paste0("Incomplete interviews = ", sum(strata_data$incomplete))
+      footnotes[[strata_val]] <- paste0("N antimalarial-stocking outlets: ", anyam_text, ". ", incomplete_text)
+    }
+    return(footnotes)
+  }
+}
+```
+
+```{r run_analysis, include=FALSE}
+# Initialize results storage
+results_list <- list()
+footnotes_list <- list()
+
+# 1. National level results
+national_results <- calculate_availability(survey_design)
+national_footnote <- calculate_footnotes(processed_data)
+
+results_list[["national"]] <- national_results
+footnotes_list[["national"]] <- national_footnote
+
+# 2. Strata1 results (if available)
+if (has_strata1) {
+ strata1_results <- calculate_availability(survey_design, group_vars = "strata1")
+ 
+ if (nrow(strata1_results) > 0) {
+   results_list[["strata1"]] <- strata1_results
+   footnotes_list[["strata1"]] <- calculate_footnotes(
+     processed_data, 
+     strata1_var = strata_info$strata1$variable
+   )
+ }
+}
+
+# 3. Strata2 results (if available)
+if (has_strata2) {
+ strata2_results <- calculate_availability(survey_design, group_vars = "strata2")
+ 
+ if (nrow(strata2_results) > 0) {
+   results_list[["strata2"]] <- strata2_results
+   footnotes_list[["strata2"]] <- calculate_footnotes(
+     processed_data,
+     strata2_var = strata_info$strata2$variable
+   )
+ }
+}
+
+# 4. Cross-stratification results (if both strata present)
+if (cross_strata_possible) {
+  strata1_values <- unique(survey_design$variables$strata1)
+  strata1_values <- strata1_values[!is.na(strata1_values)]
+  strata2_values <- unique(survey_design$variables$strata2) 
+  strata2_values <- strata2_values[!is.na(strata2_values)]
+  
+  all_cross_results <- tibble()
+  
+  for (strata1_val in strata1_values) {
+    for (strata2_val in strata2_values) {
+      subset_condition <- survey_design$variables$strata1 == strata1_val & 
+                         survey_design$variables$strata2 == strata2_val &
+                         !is.na(survey_design$variables$strata1) &
+                         !is.na(survey_design$variables$strata2)
+      
+      if (sum(subset_condition) > 10) {  # Need more observations for availability analysis
+        subset_design <- subset(survey_design, subset_condition)
+        
+        combo_results <- calculate_availability(subset_design)
+        
+        if (nrow(combo_results) > 0) {
+          combo_results$strata1 <- strata1_val
+          combo_results$strata2 <- strata2_val
+          all_cross_results <- bind_rows(all_cross_results, combo_results)
+        }
+      }
+    }
+  }
+  
+  if (nrow(all_cross_results) > 0) {
+    for (strata1_val in strata1_values) {
+      strata1_data <- all_cross_results %>% filter(strata1 == strata1_val)
+      if (nrow(strata1_data) > 0) {
+        cross_id <- paste0("cross_", strata1_val)
+        results_list[[cross_id]] <- strata1_data
+        
+        processed_strata1 <- processed_data %>% filter(strata1 == strata1_val)
+        footnotes_list[[cross_id]] <- calculate_footnotes(processed_strata1)
+      }
+    }
+  }
+}
+```
+
+
+```{r create_excel_function}
+# Create Excel output with wide format by outlet type  
+source(here("Scripts", "3_Analysis", "create_excel_function.R"))
+
+excel_success <- create_excel_output(
+  results_list = results_list,
+  footnotes_list = footnotes_list, 
+  indicator_config = indicator_config,
+  country = country,
+  year = year,
+  include_antimalarial_col = TRUE  
+)
+
+if (!excel_success) {
+  message("Incomplete to create Excel file")
+} 
+```
+
+
+```{r analysis_summary, results='asis'}
+cat("## Analysis Summary\n\n")
+cat("**Data Processing:**\n\n")
+cat("- Original outlets surveyed:", nrow(outlet_data), "\n")
+cat("- Antimalarial-stocking outlets included:", nrow(processed_data), "\n")
+cat("- Survey design: Complex sampling with outlet weights\n")
+cat("- Population: Antimalarial-stocking outlets only (anyam == 1)\n\n")
+
+cat("**Stratification:**\n\n")
+if (length(strata_info) > 0) {
+  for (stratum_name in names(strata_info)) {
+    stratum <- strata_info[[stratum_name]]
+    cat("-", stratum_name, "(", length(stratum$values), "levels):", 
+        paste(stratum$values, collapse = ", "), "\n")
+  }
+  if (cross_strata_possible) {
+    cat("- Cross-stratification: Available\n")
+  }
+  cat("\n")
+} else {
+  cat("- No stratification variables available\n\n")
+}
+
+available_antimalarial_vars <- intersect(indicator_config$antimalarial_vars, names(processed_data))
+available_outlet_vars <- intersect(indicator_config$outlet_dummies, names(processed_data))
+
+cat("**Available Products:**", length(available_antimalarial_vars), "antimalarial categories\n")
+cat("**Available Outlet Types:**", length(available_outlet_vars), "outlet types\n\n")
+```
+
+## Results
+
+### Figure 1: ACT Availability by ACT Type (National)
+
+```{r figure_act_national, fig.width=12, fig.height=8}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Filter for ACT types and aggregate across outlet types
+  act_by_type <- results_list[["national"]] %>%
+    filter(antimalarial_type %in% indicator_config$act_types) %>%
+    group_by(antimalarial_type, antimalarial_label) %>%
+    summarise(
+      point_estimate = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      lower_ci = weighted.mean(lower_ci, sample_size, na.rm = TRUE),
+      upper_ci = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(act_by_type) > 0) {
+    ggplot(act_by_type, aes(x = fct_reorder(antimalarial_label, point_estimate), 
+                           y = point_estimate)) +
+      geom_col(fill = "#4F81BD", alpha = 0.8) +
+      geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.2) +
+      geom_text(aes(label = paste0(round(point_estimate, 1), "%")),
+                hjust = -0.2, size = 3.5) +
+      coord_flip() +
+      labs(
+        title = str_wrap("ACT Availability by ACT Type Among Antimalarial-Stocking Outlets (National)", width = 60),
+        x = "ACT Type",
+        y = "Percentage of Antimalarial-Stocking Outlets (%)",
+        caption = "Error bars show 95% confidence intervals"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 11)
+      ) +
+      expand_limits(y = max(act_by_type$upper_ci, na.rm = TRUE) * 1.1)
+  }
+}
+```
+
+### Figure 2: ACT Availability by Outlet Type (National)
+
+```{r figure_outlet_national, fig.width=12, fig.height=8}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Filter for "Any ACT" across outlet types
+  any_act_by_outlet <- results_list[["national"]] %>%
+    filter(antimalarial_type == "st_anyact")
+  
+  if (nrow(any_act_by_outlet) > 0) {
+    ggplot(any_act_by_outlet, aes(x = fct_reorder(outlet_label, point_estimate), 
+                                   y = point_estimate)) +
+      geom_col(fill = "#C0504D", alpha = 0.8) +
+      geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.2) +
+      geom_text(aes(label = paste0(round(point_estimate, 1), "%")),
+                hjust = -0.2, size = 3.5) +
+      coord_flip() +
+      labs(
+        title = str_wrap("Any ACT Availability by Outlet Type Among Antimalarial-Stocking Outlets (National)", width = 60),
+        x = "Outlet Type",
+        y = "Percentage with Any ACT (%)",
+        caption = "Error bars show 95% confidence intervals"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 11)
+      ) +
+      expand_limits(y = max(any_act_by_outlet$upper_ci, na.rm = TRUE) * 1.1)
+  }
+}
+```
+
+`r if(has_strata1) "### Figure 3: ACT Availability by ACT Type and Strata1"`
+
+```{r figure_act_type_strata1, fig.width=12, fig.height=8}
+if ("strata1" %in% names(results_list) && nrow(results_list[["strata1"]]) > 0) {
+  
+  strata1_act_by_type <- results_list[["strata1"]] %>%
+    filter(antimalarial_type %in% indicator_config$act_types) %>%
+    group_by(antimalarial_type, antimalarial_label, strata1) %>%
+    summarise(
+      point_estimate = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      lower_ci = weighted.mean(lower_ci, sample_size, na.rm = TRUE),
+      upper_ci = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(strata1_act_by_type) > 0) {
+    ggplot(strata1_act_by_type, aes(x = fct_reorder(antimalarial_label, point_estimate), 
+                                   y = point_estimate, fill = strata1)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      geom_text(aes(y = upper_ci + 2, 
+                    label = paste0(round(point_estimate, 1), "%")),
+                position = position_dodge(width = 0.9), hjust = 0, size = 3) +
+      coord_flip() +
+      labs(
+        title = str_wrap("ACT Availability by ACT Type and Strata1 Among Antimalarial-Stocking Outlets", width = 60),
+        x = "ACT Type",
+        y = "Percentage of Antimalarial-Stocking Outlets (%)",
+        fill = "Strata1",
+        caption = "Error bars show 95% confidence intervals"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+      ) +
+      scale_fill_brewer(type = "qual", palette = "Set1")
+  }
+}
+```
+
+`r if(has_strata1) "### Figure 4: ACT Availability by Outlet Type and Strata1"`
+
+```{r figure_act_outlet_strata1, fig.width=12, fig.height=8}
+if ("strata1" %in% names(results_list) && nrow(results_list[["strata1"]]) > 0) {
+  
+  strata1_any_act <- results_list[["strata1"]] %>%
+    filter(antimalarial_type == "st_anyact")
+  
+  if (nrow(strata1_any_act) > 0) {
+    ggplot(strata1_any_act, aes(x = fct_reorder(outlet_label, point_estimate), 
+                               y = point_estimate, fill = strata1)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      geom_text(aes(y = upper_ci + 2, 
+                    label = paste0(round(point_estimate, 1), "%")),
+                position = position_dodge(width = 0.9), hjust = 0, size = 3) +
+      coord_flip() +
+      labs(
+        title = str_wrap("Any ACT Availability by Outlet Type and Strata1 Among Antimalarial-Stocking Outlets", width = 60),
+        x = "Outlet Type",
+        y = "Percentage with Any ACT (%)",
+        fill = "Strata1",
+        caption = "Error bars show 95% confidence intervals"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+      ) +
+      scale_fill_brewer(type = "qual", palette = "Set1")
+  }
+}
+```
+
+`r if(has_strata2) "### Figure 5: ACT Availability by ACT Type and Strata2"`
+
+```{r figure_act_type_strata2, fig.width=12, fig.height=8}
+if ("strata2" %in% names(results_list) && nrow(results_list[["strata2"]]) > 0) {
+  
+  strata2_act_by_type <- results_list[["strata2"]] %>%
+    filter(antimalarial_type %in% indicator_config$act_types) %>%
+    group_by(antimalarial_type, antimalarial_label, strata2) %>%
+    summarise(
+      point_estimate = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      lower_ci = weighted.mean(lower_ci, sample_size, na.rm = TRUE),
+      upper_ci = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(strata2_act_by_type) > 0) {
+    ggplot(strata2_act_by_type, aes(x = fct_reorder(antimalarial_label, point_estimate), 
+                                   y = point_estimate, fill = strata2)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      coord_flip() +
+      labs(
+        title = str_wrap("ACT Availability by ACT Type and Strata2 Among Antimalarial-Stocking Outlets", width = 60),
+        x = "ACT Type",
+        y = "Percentage of Antimalarial-Stocking Outlets (%)",
+        fill = "Strata2",
+        caption = "Error bars show 95% confidence intervals"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+      ) +
+      scale_fill_brewer(type = "qual", palette = "Set2")
+  }
+}
+```
+
+`r if(has_strata2) "### Figure 6: ACT Availability by Outlet Type and Strata2"`
+
+```{r figure_act_outlet_strata2, fig.width=12, fig.height=8}
+if ("strata2" %in% names(results_list) && nrow(results_list[["strata2"]]) > 0) {
+  
+  strata2_any_act <- results_list[["strata2"]] %>%
+    filter(antimalarial_type == "st_anyact")
+  
+  if (nrow(strata2_any_act) > 0) {
+    ggplot(strata2_any_act, aes(x = fct_reorder(outlet_label, point_estimate), 
+                               y = point_estimate, fill = strata2)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      coord_flip() +
+      labs(
+        title = str_wrap("Any ACT Availability by Outlet Type and Strata2 Among Antimalarial-Stocking Outlets", width = 60),
+        x = "Outlet Type", 
+        y = "Percentage with Any ACT (%)",
+        fill = "Strata2",
+        caption = "Error bars show 95% confidence intervals"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+      ) +
+      scale_fill_brewer(type = "qual", palette = "Set2")
+  }
+}
+```
+
+
+\newpage
+
+### Table 1: National Level Results - Complete Antimalarial × Outlet Matrix
+
+```{r table_national_complete, results='asis'}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Create comprehensive table with all antimalarials as rows, outlets as columns
+  point_estimates <- results_list[["national"]] %>%
+    select(antimalarial_label, outlet_label, point_estimate) %>%
+    arrange(antimalarial_label, outlet_label) %>%
+    arrange(factor(antimalarial_label, levels = indicator_config$antimalarial_order)) %>% 
+    pivot_wider(names_from = outlet_label, values_from = point_estimate, values_fill = 0) %>%
+    mutate(across(where(is.numeric), ~round(., 1)))
+  
+  table_output <- knitr::kable(point_estimates, format = "markdown")
+  cat(table_output, sep = "\n")
+  cat("\n*", footnotes_list[["national"]], "*\n\n")
+  
+} else {
+  cat("**No national level data available**\n\n")
+}
+```
+
+
+## Technical Notes
+
+**Survey Design:** Complex sampling with outlet weights (wt_alloutlet), matching Stata's survey design specification.
+
+**Population:** Antimalarial-stocking outlets only (`anyam == 1`), which is a subset of screened outlets that have any antimalarial products in stock.
+
+**Analysis Method:** Survey-weighted proportions of antimalarial-stocking outlets with specific antimalarial products in stock. Each product-outlet combination analyzed separately using subpopulation methods (subpop(if anyAM==1 & outlet==1)).
+
+**Confidence Intervals:** 95% confidence intervals calculated for proportions using logit method.
+
+**Product Categories:**  
+- **ACTs:** Artemisinin-based combination therapies including AL, ASAQ, APPQ, DHAPPQ, ARPPQ, and other ACTs  
+- **Quality Assured:** Products meeting WHO prequalification and/or national approval standards     
+- **Non-ACTs:** Including quinine, chloroquine, SP-based treatments, and artemisinin monotherapies  
+- **Severe Malaria:** Injectable and rectal formulations for severe cases  
+
+**Excel Output:** Results exported with separate sheets for each stratification level, following Stata .do file structure with detailed product-by-outlet breakdowns.
+
+**Footnotes:** Include antimalarial-stocking outlet counts by type and incomplete interview counts (outlets with antimalarials that met screening criteria but did not complete full interviews).
+
+**Results Structure:**  
+- **National:** Overall availability across all antimalarial-stocking outlets  
+- **Strata1:** Availability by primary stratification variable (always present)  
+- **Strata2:** Availability by secondary stratification variable (if present and has variation)    
+- **Cross-stratification:** Availability by strata2 within each level of strata1 (if both strata present)  
+
+**Figure Structure:**  
+- **By ACT Type:** Proportion of antimalarial-stocking outlets with each ACT product in stock  
+- **By Outlet Type:** Proportion of each antimalarial-stocking outlet type with any ACT in stock  
+- Both perspectives provided at national and strata levels  
+
+**Key Difference from Indicator 2.1:** This indicator (2.2) restricts analysis to outlets that stock any antimalarials, providing a more focused view of product mix among antimalarial providers. Indicator 2.1 analyzed all screened outlets regardless of whether they stocked antimalarials.
+
+---
+
+**Report generated:** `r format(Sys.time(), '%B %d, %Y at %I:%M %p')`

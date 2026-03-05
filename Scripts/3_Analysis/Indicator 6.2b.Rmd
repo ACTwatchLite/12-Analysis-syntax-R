@@ -1,0 +1,796 @@
+---
+title: "ACTwatch Indicator 6.2b - Purchase Price of RDTs from Suppliers (Local Currency)"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output: 
+  word_document:
+    toc: false
+    toc_depth: 2
+    reference_docx: null
+---
+
+## Indicator Definition
+
+**Indicator Group:** Price - Purchase price of RDTs from suppliers
+
+**Description:** The median purchase price per RDT unit from suppliers, measured in local currency, by RDT type and outlet type
+
+**Numerator:** Median purchase price per RDT unit (local currency) for a specific RDT product/category
+
+**Denominator:** All RDT products with purchase price data available for that product/category
+
+**Disaggregation:** By RDT type and outlet type; additional disaggregation by strata if available
+
+**Data Source:** Product data (long format) - includes both antimalarials and RDTs
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, 
+                      fig.width = 12, fig.height = 8)
+
+# Set survey option to handle single PSU strata
+options(survey.lonely.psu = "adjust")
+
+library(tidyverse)
+library(survey)
+library(openxlsx)
+library(forcats)
+library(here)
+library(data.table)
+
+# Set parameters
+if (!exists("country")) stop("Global variable 'country' not found")
+if (!exists("year")) stop("Global variable 'year' not found") 
+
+# Load product data (long format) to detect available RDT variables
+data_file <- here("Data", "Final data", 
+                  paste0(country, "_", year, "_full_data.csv"))
+
+if (!file.exists(data_file)) {
+  stop("Data file not found: ", data_file)
+}
+
+product_data_temp <- fread(data_file) %>%
+  rename_with(tolower)
+
+# Dynamically detect RDT manufacturer variables and their labels
+# This ensures the analysis works across different countries/survey rounds
+
+# Start with base RDT variables
+rdt_vars <- c("rdt_true", "qardt")
+rdt_labels <- list(
+  "rdt_true" = "RDT audited is true RDT",
+  "qardt" = "WHO PQ RDT"
+)
+
+# Detect manufacturer dummy variables (rdtmanu_1, rdtmanu_2, rdtmanu_3, etc.)
+manu_vars <- names(product_data_temp)[grepl("^rdtmanu_[0-9]+$", names(product_data_temp))]
+
+if (length(manu_vars) > 0 && "rdtmanu" %in% names(product_data_temp)) {
+  # Extract manufacturer labels from data
+  mfr_mapping <- product_data_temp %>%
+    filter(!is.na(rdtmanu)) %>%
+    select(rdtmanu, all_of(manu_vars)) %>%
+    pivot_longer(cols = all_of(manu_vars), 
+                 names_to = "var", 
+                 values_to = "value") %>%
+    filter(value == 1) %>%
+    distinct(var, rdtmanu) %>%
+    arrange(var)
+  
+  # Add manufacturer variables to rdt_vars and labels
+  for (i in 1:nrow(mfr_mapping)) {
+    var_name <- mfr_mapping$var[i]
+    mfr_name <- mfr_mapping$rdtmanu[i]
+    
+    rdt_vars <- c(rdt_vars, var_name)
+    rdt_labels[[var_name]] <- paste0("RDT manufacturer: ", mfr_name)
+  }
+  
+  cat("Found", length(manu_vars), "manufacturer variables:\n")
+  print(mfr_mapping)
+} else {
+  cat("No manufacturer variables found or rdtmanu variable missing\n")
+}
+
+# Clean up temporary data
+rm(product_data_temp)
+
+# Configuration matching the Stata analysis structure
+indicator_config <- list(
+  indicator_id = "6.2b",
+  title = "Purchase Price of RDTs from Suppliers (Local Currency)", 
+  description = "Median purchase price per RDT unit from suppliers by type and outlet",
+  
+  # Analysis settings
+  dataset = "product", # Product data in long format (includes both AMs and RDTs)
+  analysis_type = "price",
+  survey_weight = "wt_alloutlet", # Standard outlet weight for price analysis
+  price_variable = "unitrdtwholeprice", # Purchase price per RDT unit in local currency
+  population_filter = quote(countprod == 1), # Counted products (includes both anyam==1 and rdt_true==1)
+  
+  # Outlet types (matching Stata outvars1)
+  outlet_dummies = c("private_nonprofit", "private_forprofit", "pharmacy",
+                    "laboratory", "drug_store", "total_informal", "total_retail", "wholesale"),
+  outlet_labels = list(
+    "private_nonprofit" = "Private Not-for-Profit",
+    "private_forprofit" = "Private For-Profit", 
+    "pharmacy" = "Pharmacy",
+    "laboratory" = "Laboratory", 
+    "drug_store" = "Drug Store",
+    "total_informal" = "Informal (Total)",
+    "total_retail" = "Retail (Total)",
+    "wholesale" = "Wholesaler"
+  ),
+
+  # RDT products - dynamically detected above
+  rdt_vars = rdt_vars,
+  rdt_labels = rdt_labels,
+  rdt_order = rdt_vars,
+  
+  # Output settings
+  file_suffix = "Purchase price of RDTs from suppliers-local currency"
+)
+
+cat("\nFinal RDT variables to analyze:\n")
+for (i in seq_along(indicator_config$rdt_vars)) {
+  var_name <- indicator_config$rdt_vars[i]
+  var_label <- indicator_config$rdt_labels[[var_name]]
+  cat(sprintf("%d. %s: %s\n", i, var_name, var_label))
+}
+
+# Source the create_excel_function (if available)
+excel_function_path <- here("Scripts", "3_Analysis", "create_excel_function.R")
+if (file.exists(excel_function_path)) {
+  source(excel_function_path)
+}
+```
+
+```{r load_data, include=FALSE}
+# Load product data (long format)
+data_file <- here("Data", "Final data", 
+                  paste0(country, "_", year, "_full_data.csv"))
+
+if (!file.exists(data_file)) {
+  stop("Data file not found: ", data_file)
+}
+
+product_data <- fread(data_file) %>%
+  # Convert all variable names to lowercase for consistency
+  rename_with(tolower) %>%
+  # Ensure strata variables are character
+  mutate(across(any_of(c("strata1", "strata2")), as.character)) %>%
+  # Clean up blank but non-missing strata values
+  mutate(
+    strata1 = dplyr::na_if(strata1, ""),
+    strata2 = dplyr::na_if(strata2, "")
+  ) %>%
+  # Drop if outlet category information is missing (following Stata logic)
+  filter(!is.na(outcat2))
+```
+
+```{r data_processing, include=FALSE}
+# Following Stata logic: ensuring RDTs included
+# countprod=1 if anyAM==1; recode countprod (.=1) if rdt_true==1
+product_data <- product_data %>%
+  mutate(
+    countprod = case_when(
+      anyam == 1 ~ 1,
+      rdt_true == 1 ~ 1,
+      TRUE ~ 0
+    )
+  )
+
+# Following Stata logic: ensure outlet variables are coded as 0/1
+available_outlet_vars <- intersect(indicator_config$outlet_dummies, names(product_data))
+
+# Recode outlet variables (following Stata: recode `x'(.=0) if countprod==1)
+product_data <- product_data %>%
+  mutate(
+    across(all_of(available_outlet_vars), 
+           ~ifelse(is.na(.) & countprod == 1, 0, .))
+  )
+
+# Apply population filter (counted products)
+base_data <- product_data %>%
+  filter(!!indicator_config$population_filter)
+
+# Detect available RDT variables in the data
+available_rdt_vars <- intersect(indicator_config$rdt_vars, names(base_data))
+if (length(available_rdt_vars) == 0) {
+  stop("No RDT variables found in data. Expected variables: ", 
+       paste(indicator_config$rdt_vars, collapse = ", "))
+}
+
+# Detect strata structure
+strata_info <- list()
+if ("strata1" %in% names(base_data) && 
+    length(unique(na.omit(base_data$strata1))) > 1) {
+  strata1_values <- unique(na.omit(base_data$strata1))
+  strata1_values <- strata1_values[strata1_values != "" & !is.na(trimws(strata1_values))]
+  if (length(strata1_values) > 1) {
+    strata_info$strata1 <- list(variable = "strata1", values = strata1_values)
+  }
+}
+
+if ("strata2" %in% names(base_data) && 
+    length(unique(na.omit(base_data$strata2))) > 1) {
+  strata2_values <- unique(na.omit(base_data$strata2))
+  strata2_values <- strata2_values[strata2_values != "" & !is.na(trimws(strata2_values))]
+  if (length(strata2_values) > 1) {
+    strata_info$strata2 <- list(variable = "strata2", values = strata2_values)
+  }
+}
+
+has_strata1 <- "strata1" %in% names(strata_info)
+has_strata2 <- "strata2" %in% names(strata_info)
+cross_strata_possible <- has_strata1 && has_strata2
+```
+
+```{r analysis_function, include=FALSE}
+# Function to calculate prices for a specific RDT product and outlet combination
+analyze_rdt_prices <- function(data, rdt_var, outlet_vars, price_var, survey_weight, 
+                               strata_var = NULL, strata_values = NULL) {
+  
+  # Check if variables exist
+  if (!rdt_var %in% names(data)) {
+    warning(paste("RDT variable", rdt_var, "not found"))
+    return(NULL)
+  }
+  if (!price_var %in% names(data)) {
+    warning(paste("Price variable", price_var, "not found"))
+    return(NULL)
+  }
+  
+  # Filter for this RDT type and non-missing prices
+  rdt_data <- data %>%
+    filter(!!sym(rdt_var) == 1 & !is.na(!!sym(price_var)))
+  
+  if (nrow(rdt_data) == 0) {
+    return(NULL)
+  }
+  
+  # Apply strata filter if specified
+  if (!is.null(strata_var) && !is.null(strata_values)) {
+    if (length(strata_values) == 1) {
+      rdt_data <- rdt_data %>%
+        filter(!!sym(strata_var) == strata_values)
+    }
+  }
+  
+  if (nrow(rdt_data) == 0) {
+    return(NULL)
+  }
+  
+  # Setup survey design
+  rdt_data_filtered <- rdt_data %>%
+    filter(!is.na(!!sym(survey_weight)))
+  
+  # Check if we have enough PSUs for survey design
+  n_psu <- rdt_data_filtered %>% 
+    summarise(n_psu = n_distinct(c4, na.rm = TRUE)) %>% 
+    pull(n_psu)
+  
+  if (n_psu < 2) {
+    message(paste("Skipping", rdt_var, "- insufficient PSUs (n =", n_psu, ")"))
+    return(NULL)
+  }
+  
+  survey_design <- tryCatch({
+    rdt_data_filtered %>%
+      as_survey_design(
+        ids = c4,
+        weights = !!sym(survey_weight),
+        strata = strata1,
+        fpc = fpc
+      )
+  }, error = function(e) {
+    message(paste("Error creating survey design for", rdt_var, ":", e$message))
+    return(NULL)
+  })
+  
+  if (is.null(survey_design)) {
+    return(NULL)
+  }
+  
+  results <- tibble()
+  
+  # Calculate prices for each outlet type
+  for (outlet in outlet_vars) {
+    if (!outlet %in% names(rdt_data)) next
+    
+    outlet_data <- survey_design %>%
+      filter(!!sym(outlet) == 1)
+    
+    if (nrow(outlet_data) == 0) next
+    
+    # Calculate weighted percentiles
+    tryCatch({
+      # Try using statar package if available
+      if (requireNamespace("statar", quietly = TRUE)) {
+        pctiles <- outlet_data %>%
+          summarise(
+            q25 = statar::pctile(!!sym(price_var), probs = 0.25, w = !!sym(survey_weight)),
+            q50 = statar::pctile(!!sym(price_var), probs = 0.50, w = !!sym(survey_weight)),
+            q75 = statar::pctile(!!sym(price_var), probs = 0.75, w = !!sym(survey_weight)),
+            n = n()
+          )
+      } else {
+        # Fallback to survey package
+        pctiles <- tibble(
+          q25 = as.numeric(svyquantile(as.formula(paste0("~", price_var)), 
+                                       outlet_data, quantiles = 0.25, na.rm = TRUE)),
+          q50 = as.numeric(svyquantile(as.formula(paste0("~", price_var)), 
+                                       outlet_data, quantiles = 0.50, na.rm = TRUE)),
+          q75 = as.numeric(svyquantile(as.formula(paste0("~", price_var)), 
+                                       outlet_data, quantiles = 0.75, na.rm = TRUE)),
+          n = nrow(outlet_data)
+        )
+      }
+      
+      result_row <- tibble(
+        rdt_type = rdt_var,
+        antimalarial_label = indicator_config$rdt_labels[[rdt_var]] %||% rdt_var,
+        outlet_type = outlet,
+        outlet_label = indicator_config$outlet_labels[[outlet]] %||% outlet,
+        point_estimate = pctiles$q50,
+        lower_ci = pctiles$q25,
+        upper_ci = pctiles$q75,
+        sample_size = pctiles$n
+      )
+      
+      if (!is.null(strata_var)) {
+        if (length(strata_values) == 1) {
+          result_row[[strata_var]] <- strata_values
+        }
+      }
+      
+      results <- bind_rows(results, result_row)
+    }, error = function(e) {
+      message(paste("Error calculating percentiles for", outlet, ":", e$message))
+    })
+  }
+  
+  return(results)
+}
+
+# Function to calculate footnotes
+calculate_footnotes <- function(data, price_var) {
+  # Count outlets that met screening but didn't complete full interview
+  incomplete_interviews <- data %>%
+    filter(finalintstat %in% c(203, 204, 205, 207, 208, 303, 304, 305, 307, 308, 309, 310) & 
+           anyam == 1) %>%
+    nrow()
+  
+  # Count products missing price data
+  missing_prices <- data %>%
+    filter(anyam == 1 & is.na(!!sym(price_var))) %>%
+    nrow()
+  
+  paste0("N outlets that met screening criteria but did not complete full interview: ", 
+         incomplete_interviews, 
+         "; N RDT products audited but missing price information: ", 
+         missing_prices)
+}
+```
+
+```{r run_analysis, include=FALSE}
+# Initialize results storage
+results_list <- list()
+footnotes_list <- list()
+
+# Calculate overall footnote
+overall_footnote <- calculate_footnotes(base_data, indicator_config$price_variable)
+
+# Analyze each RDT type
+for (rdt_var in available_rdt_vars) {
+  
+  # National level
+  national_results <- analyze_rdt_prices(
+    base_data, rdt_var, available_outlet_vars, 
+    indicator_config$price_variable, indicator_config$survey_weight
+  )
+  
+  if (!is.null(national_results) && nrow(national_results) > 0) {
+    if (!"national" %in% names(results_list)) {
+      results_list[["national"]] <- tibble()
+    }
+    results_list[["national"]] <- bind_rows(results_list[["national"]], national_results)
+  }
+  
+  # Strata1 level
+  if (has_strata1) {
+    for (strata_val in strata_info$strata1$values) {
+      strata1_results <- analyze_rdt_prices(
+        base_data, rdt_var, available_outlet_vars, 
+        indicator_config$price_variable, indicator_config$survey_weight,
+        strata_var = "strata1", strata_values = strata_val
+      )
+      
+      if (!is.null(strata1_results) && nrow(strata1_results) > 0) {
+        if (!"strata1" %in% names(results_list)) {
+          results_list[["strata1"]] <- tibble()
+        }
+        results_list[["strata1"]] <- bind_rows(results_list[["strata1"]], strata1_results)
+      }
+    }
+  }
+  
+  # Strata2 level
+  if (has_strata2) {
+    for (strata_val in strata_info$strata2$values) {
+      strata2_results <- analyze_rdt_prices(
+        base_data, rdt_var, available_outlet_vars, 
+        indicator_config$price_variable, indicator_config$survey_weight,
+        strata_var = "strata2", strata_values = strata_val
+      )
+      
+      if (!is.null(strata2_results) && nrow(strata2_results) > 0) {
+        if (!"strata2" %in% names(results_list)) {
+          results_list[["strata2"]] <- tibble()
+        }
+        results_list[["strata2"]] <- bind_rows(results_list[["strata2"]], strata2_results)
+      }
+    }
+  }
+  
+  # Cross-stratification
+  if (cross_strata_possible) {
+    for (s1_val in strata_info$strata1$values) {
+      for (s2_val in strata_info$strata2$values) {
+        cross_data <- base_data %>%
+          filter(strata1 == s1_val & strata2 == s2_val)
+        
+        if (nrow(cross_data) > 0) {
+          cross_results <- analyze_rdt_prices(
+            cross_data, rdt_var, available_outlet_vars, 
+            indicator_config$price_variable, indicator_config$survey_weight
+          )
+          
+          if (!is.null(cross_results) && nrow(cross_results) > 0) {
+            cross_results <- cross_results %>%
+              mutate(strata1 = s1_val, strata2 = s2_val)
+            
+            cross_name <- paste0("cross_", s1_val)
+            if (!cross_name %in% names(results_list)) {
+              results_list[[cross_name]] <- tibble()
+            }
+            results_list[[cross_name]] <- bind_rows(results_list[[cross_name]], cross_results)
+          }
+        }
+      }
+    }
+  }
+}
+
+# Set footnotes for all sheets
+for (sheet_name in names(results_list)) {
+  footnotes_list[[sheet_name]] <- overall_footnote
+}
+```
+
+```{r export_excel, include=FALSE}
+# Use the standard create_excel_output function
+excel_success <- create_excel_output(
+  results_list = results_list,
+  footnotes_list = footnotes_list, 
+  indicator_config = indicator_config,
+  country = country,
+  year = year,
+  include_antimalarial_col = TRUE
+)
+
+if (excel_success) {
+  cat("Excel file created successfully\n")
+} else {
+  cat("Warning: Excel file creation encountered issues\n")
+}
+```
+
+\newpage
+
+## Executive Summary
+
+This indicator analyzes the median purchase prices of Rapid Diagnostic Tests (RDTs) from suppliers, measured in local currency. The analysis covers:
+
+- **Any RDT:** All RDT products
+- **Quality Assured RDTs:** RDTs meeting quality assurance standards
+
+Results are disaggregated by outlet type and, where applicable, by geographic or administrative strata.
+
+**Key Findings:**
+
+```{r summary_stats, results='asis'}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Summarize by RDT type
+  summary_by_rdt <- results_list[["national"]] %>%
+    group_by(antimalarial_label) %>%
+    summarise(
+      median_price = median(point_estimate, na.rm = TRUE),
+      min_price = min(point_estimate, na.rm = TRUE),
+      max_price = max(point_estimate, na.rm = TRUE),
+      outlets_offering = n(),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(median_price))
+  
+  cat("\n**RDT Purchase Price Summary (Local Currency):**\n\n")
+  for (i in 1:nrow(summary_by_rdt)) {
+    cat(paste0("- **", summary_by_rdt$antimalarial_label[i], ":** ", 
+               "Median = ", round(summary_by_rdt$median_price[i], 2), " LCU",
+               " (range: ", round(summary_by_rdt$min_price[i], 2), 
+               " to ", round(summary_by_rdt$max_price[i], 2), " LCU)\n"))
+  }
+  
+} else {
+  cat("**No national level data available**\n\n")
+}
+```
+
+\newpage
+
+## Figures
+
+### Figure 1: RDT Purchase Prices by Type (National Level)
+
+```{r figure_national_prices, fig.width=12, fig.height=8}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Calculate median across outlets for each RDT type
+  national_rdt_prices <- results_list[["national"]] %>%
+    group_by(antimalarial_label) %>%
+    summarise(
+      median_price = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      q25 = weighted.mean(lower_ci, sample_size, na.rm = TRUE),
+      q75 = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(national_rdt_prices) > 0) {
+    ggplot(national_rdt_prices, aes(x = reorder(antimalarial_label, median_price), 
+                                     y = median_price)) +
+      geom_col(fill = "#2171b5", alpha = 0.8) +
+      geom_errorbar(aes(ymin = q25, ymax = q75), width = 0.3) +
+      coord_flip() +
+      labs(
+        title = "Median RDT Purchase Prices by Type (National Level)",
+        x = "RDT Type",
+        y = "Median Purchase Price (Local Currency)",
+        caption = "Error bars show interquartile range (Q25-Q75)"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        axis.text = element_text(size = 12)
+      ) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+### Figure 2: RDT Purchase Prices by Outlet Type (National Level)
+
+```{r figure_outlet_prices, fig.width=12, fig.height=10}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  ggplot(results_list[["national"]], 
+         aes(x = fct_reorder(outlet_label, point_estimate), 
+             y = point_estimate, fill = antimalarial_label)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                  position = position_dodge(width = 0.9), width = 0.2) +
+    coord_flip() +
+    labs(
+      title = "Median RDT Purchase Prices by Outlet Type and RDT Type",
+      x = "Outlet Type",
+      y = "Median Purchase Price (Local Currency)",
+      fill = "RDT Type",
+      caption = "Error bars show interquartile range (Q25-Q75)"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom",
+      legend.text = element_text(size = 10)
+    ) +
+    scale_fill_brewer(type = "qual", palette = "Set2") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+}
+```
+
+`r if(has_strata1) "### Figure 3: RDT Purchase Prices by Type and Strata1"`
+
+```{r figure_rdt_prices_strata1, fig.width=12, fig.height=8}
+if ("strata1" %in% names(results_list) && nrow(results_list[["strata1"]]) > 0) {
+  
+  strata1_rdt_prices <- results_list[["strata1"]] %>%
+    group_by(antimalarial_label, strata1) %>%
+    summarise(
+      median_price = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      q25 = weighted.mean(lower_ci, sample_size, na.rm = TRUE),
+      q75 = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(strata1_rdt_prices) > 0) {
+    ggplot(strata1_rdt_prices, aes(x = reorder(antimalarial_label, median_price), 
+                                    y = median_price, fill = strata1)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = q25, ymax = q75), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      coord_flip() +
+      labs(
+        title = "Median RDT Purchase Prices by Type and Strata1",
+        x = "RDT Type",
+        y = "Median Purchase Price (Local Currency)",
+        fill = "Strata1",
+        caption = "Error bars show interquartile range (Q25-Q75)"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+      ) +
+      scale_fill_brewer(type = "qual", palette = "Set1") +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+`r if(has_strata2) "### Figure 4: RDT Purchase Prices by Type and Strata2"`
+
+```{r figure_rdt_prices_strata2, fig.width=12, fig.height=8}
+if ("strata2" %in% names(results_list) && nrow(results_list[["strata2"]]) > 0) {
+  
+  strata2_rdt_prices <- results_list[["strata2"]] %>%
+    group_by(antimalarial_label, strata2) %>%
+    summarise(
+      median_price = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      q25 = weighted.mean(lower_ci, sample_size, na.rm = TRUE),
+      q75 = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(strata2_rdt_prices) > 0) {
+    ggplot(strata2_rdt_prices, aes(x = reorder(antimalarial_label, median_price), 
+                                    y = median_price, fill = strata2)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = q25, ymax = q75), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      coord_flip() +
+      labs(
+        title = "Median RDT Purchase Prices by Type and Strata2",
+        x = "RDT Type",
+        y = "Median Purchase Price (Local Currency)",
+        fill = "Strata2",
+        caption = "Error bars show interquartile range (Q25-Q75)"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+      ) +
+      scale_fill_brewer(type = "qual", palette = "Set2") +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+\newpage
+
+## Tables
+
+### Table 1: National Level Results - Prices by RDT Type × Outlet Matrix
+
+```{r table_national_price, results='asis'}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Create comprehensive table with median prices as values
+  price_matrix <- results_list[["national"]] %>%
+    select(antimalarial_label, outlet_label, point_estimate) %>%
+    pivot_wider(names_from = outlet_label, values_from = point_estimate, values_fill = NA) %>%
+    mutate(across(where(is.numeric), ~round(., 2)))
+  
+  table_output <- knitr::kable(price_matrix, format = "markdown",
+                              caption = "Median Purchase Price (Local Currency)")
+  cat(table_output, sep = "\n")
+  cat("\n")
+  
+  # Add footnote
+  cat("\n**Footnote:**\n\n")
+  cat("*", overall_footnote, "*\n\n")
+  
+} else {
+  cat("**No national level data available**\n\n")
+}
+```
+
+`r if(has_strata1) "### Table 2: Strata1 Level Results"`
+
+```{r table_strata1_price, results='asis'}
+if ("strata1" %in% names(results_list) && nrow(results_list[["strata1"]]) > 0) {
+  
+  for (strata_val in strata_info$strata1$values) {
+    cat("\n#### ", strata_val, "\n\n")
+    
+    strata_data <- results_list[["strata1"]] %>%
+      filter(strata1 == strata_val)
+    
+    if (nrow(strata_data) > 0) {
+      price_matrix <- strata_data %>%
+        select(antimalarial_label, outlet_label, point_estimate) %>%
+        pivot_wider(names_from = outlet_label, values_from = point_estimate, values_fill = NA) %>%
+        mutate(across(where(is.numeric), ~round(., 2)))
+      
+      table_output <- knitr::kable(price_matrix, format = "markdown",
+                                  caption = paste("Median Purchase Price (Local Currency) -", strata_val))
+      cat(table_output, sep = "\n")
+      cat("\n")
+    }
+  }
+}
+```
+
+\newpage
+
+## Technical Notes
+
+**Survey Design:** Complex sampling with outlet weights (`wt_alloutlet`), cluster sampling (c4), stratification (strata1), and finite population correction (fpc).
+
+**Population Filter:** Analysis limited to:  
+- Counted products (`countprod == 1`) which includes both antimalarials (`anyam == 1`) and RDTs (`rdt_true == 1`)
+- Products with non-missing purchase price data  
+
+**Data Source:** Full product data (`${country}_${year}_full_data`) containing both antimalarials and RDTs
+
+**Price Variable:** `unitrdtwholeprice` - Purchase price per RDT unit from suppliers in local currency
+
+**RDT Types Analyzed:**
+
+1. **Any RDT** (`rdt_true`): All RDT products regardless of quality status
+2. **Quality Assured RDT** (`qardt`): RDTs meeting quality assurance standards
+
+**Statistical Method:** Survey-weighted quantiles (25th, 50th, and 75th percentiles) using `statar::pctile()` for weighted percentiles, with fallback to `survey` package's `svyquantile()`.
+
+**Results Structure:**  
+- **National:** Overall purchase price medians across all outlets with price data
+- **Strata1:** Purchase price medians by primary stratification variable (if present and varies)  
+- **Strata2:** Purchase price medians by secondary stratification variable (if present and varies)  
+- **Cross-stratification:** Purchase price medians by strata2 within each level of strata1 (if both strata present)  
+
+**Flexible Stratification:** Unlike the original Stata code which hardcoded urban/rural categories, this R version:  
+- Uses generic `strata1` and `strata2` variable names  
+- Automatically detects available strata values  
+- Adapts to whatever stratification structure exists in your data  
+- Works with any stratification scheme (e.g., region, province, urban/rural)  
+
+**Excel Output:** Results exported to Excel workbook with separate sheets for each analysis level. Each RDT type generates its own set of results across outlet types. Median prices appear as "Point Estimate" and quartiles as "Lower CI"/"Upper CI" for consistency with other indicators.
+
+**Footnotes:** Include:
+1. Count of outlets that met screening criteria but didn't complete full interview
+2. Count of RDT products audited but missing price information
+
+**Data Standardization:** Results use common column structure (`rdt_type`, `antimalarial_label`, `outlet_type`, `point_estimate`, `lower_ci`, `upper_ci`) where:  
+- `point_estimate` = median purchase price (local currency)  
+- `lower_ci` = 25th percentile (Q25)  
+- `upper_ci` = 75th percentile (Q75)  
+- Note: `antimalarial_label` is used for consistency with Excel output function, but contains RDT type labels
+
+**Key Differences from Indicator 6.1b:**  
+- **6.1b** measures antimalarial purchase prices per AETD (tablet formulations only)
+- **6.2b** measures RDT purchase prices per unit (all RDT products)
+- Both use local currency and same analysis structure
+- 6.2b includes both antimalarials and RDTs in `countprod` definition
+
+**Comparison with Sales Price Indicators:**
+- Purchase price (6.2b) = what suppliers charge outlets
+- Sales price (5.3b if it exists) = what outlets charge customers
+- The difference represents markup/margin
+
+**Survey Design Notes:**
+- Uses `options(survey.lonely.psu = "adjust")` to handle strata with single PSUs
+- Includes error handling for RDT/outlet combinations with insufficient clusters
+- Skips combinations that cannot support variance estimation
+
+---
+
+**Report generated:** `r format(Sys.time(), '%B %d, %Y at %I:%M %p')`

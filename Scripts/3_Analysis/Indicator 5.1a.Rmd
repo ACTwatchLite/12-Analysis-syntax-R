@@ -1,0 +1,855 @@
+---
+title: "ACTwatch Indicator 5.1a - Sales Price of Antimalarial AETDs (Tablets, USD)"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output: 
+  word_document:
+    toc: false
+    toc_depth: 2
+    reference_docx: null
+---
+
+## Indicator Definition
+
+**Indicator Group:** Price - Sales price of antimalarials to customers
+
+**Description:** The median sales price per Adult Equivalent Treatment Dose (AETD) of antimalarial tablet formulations, measured in USD, by antimalarial type and outlet type
+
+**Numerator:** Median price per AETD (USD) for a specific antimalarial product/category
+
+**Denominator:** All tablet formulation products with price data available for that product/category
+
+**Disaggregation:** By antimalarial type and outlet type; additional disaggregation by strata if available
+
+**Data Source:** Product data (long format) - tablet formulations only
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, 
+                      fig.width = 12, fig.height = 8)
+
+library(tidyverse)
+library(survey)
+library(openxlsx)
+library(forcats)
+library(here)
+library(data.table)
+
+# Set parameters
+if (!exists("country")) stop("Global variable 'country' not found")
+if (!exists("year")) stop("Global variable 'year' not found") 
+
+# Configuration matching the Stata analysis structure
+indicator_config <- list(
+  indicator_id = "5.1a",
+  title = "Sales Price of Antimalarial AETDs (Tablets, USD)", 
+  description = "Median price per AETD of antimalarial tablet formulations by type and outlet",
+  
+  # Analysis settings
+  dataset = "product", # Product data in long format
+  analysis_type = "price",
+  survey_weight = "wt_alloutlet", # Standard outlet weight for price analysis
+  price_variable = "usppriceperaetddc", # Price per AETD in USD (lowercase following R convention)
+  population_filter = quote(booster == 0 & a3 == 1 & countprod == 1), # Tablets only, non-booster, counted products
+  
+  # Outlet types (matching Stata outvars1)
+  outlet_dummies = c("private_nonprofit", "private_forprofit", "pharmacy",
+                    "laboratory", "drug_store", "total_informal", "total_retail", 
+                    "wholesale"),
+  outlet_labels = list(
+    "private_nonprofit" = "Private Not-for-Profit",
+    "private_forprofit" = "Private For-Profit", 
+    "pharmacy" = "Pharmacy",
+    "laboratory" = "Laboratory", 
+    "drug_store" = "Drug Store",
+    "total_informal" = "Informal (Total)",
+    "total_retail" = "Retail (Total)",
+    "wholesale" = "Wholesaler"
+  ),
+
+  # Antimalarial products for price analysis (matching Stata pri_cov - same as volume_vars)
+  price_vars = c(
+    "anyam",              # Any antimalarial
+    "anyact",             # Any ACT
+    "al",                 # Artemether lumefantrine
+    "asaq",               # Artesunate amodiaquine
+    "appq",               # Artemisinin piperaquine
+    "dhappq",             # Dihydroartemisinin piperaquine
+    "arppq",              # Arterolane piperaquine
+    "otheract",           # Any other ACT
+    "qaact",              # QA ACT
+    "qa_all",             # WHO PQ and nationally approved
+    "qa_who",             # WHO PQ but not nationally approved
+    "qa_nat",             # Nationally approved but not WHO PQ
+    "qa_none",            # Not QA or nationally approved
+    "nonart",             # Non-artemisinins
+    "oralqn",             # Oral quinine
+    "cq",                 # Chloroquine
+    "sp",                 # Sulfadoxine pyrimethamine
+    "spaq",               # Sulfadoxine pyrimethamine amodiaquine
+    "nonartoth",          # Other non-artemisinins
+    "oartmono",           # Oral artemisinin monotherapy
+    "noartmono",          # Non-oral artemisinin monotherapy
+    "severe",             # Treatment for severe malaria
+    "recas",              # Rectal artesunate
+    "injas",              # Injectable artesunate
+    "injar",              # Injectable artemether
+    "injae",              # Injectable arteether
+    "injqn"               # Injectable quinine
+  ),
+  
+  # Product labels for better display
+  price_labels = list(
+    "anyam" = "Any antimalarial",
+    "anyact" = "Any ACT",
+    "al" = "Artemether-lumefantrine",
+    "asaq" = "Artesunate-amodiaquine", 
+    "appq" = "Artemisinin-piperaquine",
+    "dhappq" = "Dihydroartemisinin-piperaquine",
+    "arppq" = "Arterolane-piperaquine",
+    "otheract" = "Any other ACT",
+    "qaact" = "QA ACT",
+    "qa_all" = "ACT that is both WHO PQ and nationally approved",
+    "qa_who" = "ACT that is WHO PQ but not nationally approved", 
+    "qa_nat" = "ACT that is nationally approved but not WHO PQ",
+    "qa_none" = "ACT not QA or nationally approved",
+    "nonart" = "Non-artemisinins", 
+    "oralqn" = "Oral quinine",
+    "cq" = "Chloroquine",
+    "sp" = "Sulfadoxine-pyrimethamine",
+    "spaq" = "Sulfadoxine pyrimethamine amodiaquine",
+    "nonartoth" = "Other non-artemisinins",
+    "oartmono" = "Oral artemisinin monotherapy",
+    "noartmono" = "Non-oral artemisinin monotherapy",
+    "severe" = "Treatment for severe malaria",
+    "recas" = "Rectal artesunate",
+    "injas" = "Injectable artesunate",
+    "injar" = "Injectable artemether",
+    "injae" = "Injectable arteether", 
+    "injqn" = "Injectable quinine"
+  ),
+  
+  # ACT types for focused analysis
+  act_types = c("anyact", "al", "asaq", "appq", "dhappq", "arppq", "otheract"),
+  
+  # Output settings
+  file_suffix = "Sales price of tablet AETDs USD"
+)
+
+# Source the create_excel_function (if available)
+excel_function_path <- here("Scripts", "3_Analysis", "create_excel_function.R")
+if (file.exists(excel_function_path)) {
+  source(excel_function_path)
+}
+```
+
+```{r load_data, include=FALSE}
+# Load product data (long format)
+data_file <- here("Data", "Final data", 
+                  paste0(country, "_", year, "_full_data.csv"))
+
+if (!file.exists(data_file)) {
+  stop("Data file not found: ", data_file)
+}
+
+product_data <- fread(data_file) %>%
+  # Ensure strata variables are character
+  mutate(across(any_of(c("strata1", "strata2")), as.character)) %>%
+  # Clean up blank but non-missing strata values
+  mutate(
+    strata1 = dplyr::na_if(strata1, ""),
+    strata2 = dplyr::na_if(strata2, "")
+  ) %>%
+  # Drop if outlet category information is missing (following Stata logic)
+  filter(!is.na(outcat2))
+
+# Check for price variable (try both lowercase and uppercase versions)
+if (!indicator_config$price_variable %in% names(product_data)) {
+  # Try uppercase version
+  if ("usppriceperaetdDC" %in% names(product_data)) {
+    message("Using uppercase version: usppriceperaetdDC")
+    product_data <- product_data %>%
+      rename(usppriceperaetddc = usppriceperaetdDC)
+  } else {
+    stop("Price variable '", indicator_config$price_variable, "' not found in data")
+  }
+}
+```
+
+```{r data_processing, include=FALSE}
+# Following Stata logic: ensure outlet variables are coded as 0/1
+available_outlet_vars <- intersect(indicator_config$outlet_dummies, names(product_data))
+
+# Create data for footnotes (has population filter but NOT missing price filter)
+footnote_data <- product_data %>%
+  # Recode outlet variables (following Stata: recode `x'(.=0) if countprod==1)
+  mutate(
+    across(all_of(available_outlet_vars), 
+           ~ifelse(is.na(.) & countprod == 1, 0, .))
+  ) %>%
+  # Apply population filter (tablets only, non-booster, counted products)
+  filter(!!indicator_config$population_filter)
+
+# Create processed data WITH missing price filter for analysis
+processed_data <- footnote_data %>%
+  filter(!is.na(!!sym(indicator_config$price_variable)))
+
+# Detect strata structure
+strata_info <- list()
+if ("strata1" %in% names(processed_data) && 
+    length(unique(na.omit(processed_data$strata1))) > 1) {
+  strata1_values <- unique(na.omit(processed_data$strata1))
+  strata1_values <- strata1_values[strata1_values != "" & !is.na(trimws(strata1_values))]
+  if (length(strata1_values) > 1) {
+    strata_info$strata1 <- list(variable = "strata1", values = strata1_values)
+  }
+}
+
+if ("strata2" %in% names(processed_data) && 
+    length(unique(na.omit(processed_data$strata2))) > 1) {
+  strata2_values <- unique(na.omit(processed_data$strata2))
+  strata2_values <- strata2_values[strata2_values != "" & !is.na(trimws(strata2_values))]
+  if (length(strata2_values) > 1) {
+    strata_info$strata2 <- list(variable = "strata2", values = strata2_values)
+  }
+}
+
+has_strata1 <- "strata1" %in% names(strata_info)
+has_strata2 <- "strata2" %in% names(strata_info)
+cross_strata_possible <- has_strata1 && has_strata2
+```
+
+```{r survey_setup, include=FALSE}
+# Setup survey design (following Stata: svyset c4 [pweight=wt_allOutlet], strata(strata) fpc(fpc))
+survey_design <- processed_data %>%
+  filter(!is.na(!!sym(indicator_config$survey_weight))) %>%
+  as_survey_design(
+    ids = c4,
+    weights = !!sym(indicator_config$survey_weight),
+    strata = strata1,  # Using strata1 as primary design strata
+    fpc = fpc
+  )
+```
+
+```{r analysis_functions, include=FALSE}
+# Calculate median prices using weighted percentiles (standardized output format)
+calculate_price_medians <- function(survey_data, group_vars = NULL) {
+  
+  results <- tibble()
+  
+  # Available price variables (antimalarial products) in the dataset
+  available_price_vars <- intersect(indicator_config$price_vars, 
+                                    names(survey_data$variables))
+  
+  # Available outlet variables in the dataset  
+  available_outlet_vars <- intersect(indicator_config$outlet_dummies, 
+                                    names(survey_data$variables))
+  
+  price_var_name <- indicator_config$price_variable
+  
+  for (antimalarial_var in available_price_vars) {
+    for (outlet_var in available_outlet_vars) {
+      
+      tryCatch({
+        if (is.null(group_vars)) {
+          # National analysis
+          outlet_data_raw <- survey_data$variables %>%
+            filter(!!sym(outlet_var) == 1, 
+                   !!sym(antimalarial_var) == 1,
+                   !is.na(!!sym(price_var_name)))
+          
+          if (nrow(outlet_data_raw) > 0) {  # Sufficient observations
+            # Use weighted percentiles directly on the raw data
+            if (requireNamespace("statar", quietly = TRUE)) {
+              percentiles <- statar::pctile(
+                outlet_data_raw[[price_var_name]], 
+                probs = c(0.25, 0.50, 0.75),
+                wt = outlet_data_raw[[indicator_config$survey_weight]]
+              )
+              
+              result_row <- tibble(
+                antimalarial_type = antimalarial_var,
+                outlet_type = outlet_var,
+                point_estimate = percentiles[2],  # Median price
+                lower_ci = percentiles[1],        # Q25
+                upper_ci = percentiles[3],        # Q75
+                sample_size = nrow(outlet_data_raw),
+                antimalarial_label = indicator_config$price_labels[[antimalarial_var]] %||% antimalarial_var,
+                outlet_label = indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+              )
+              
+              results <- bind_rows(results, result_row)
+            } else {
+              # Fallback to survey package if statar not available
+              subset_design <- subset(survey_data, 
+                                     !!sym(outlet_var) == 1 & 
+                                     !!sym(antimalarial_var) == 1 &
+                                     !is.na(!!sym(price_var_name)))
+              
+              price_formula <- as.formula(paste0("~", price_var_name))
+              q25 <- svyquantile(price_formula, subset_design, quantiles = 0.25, method = "constant")
+              q50 <- svyquantile(price_formula, subset_design, quantiles = 0.50, method = "constant") 
+              q75 <- svyquantile(price_formula, subset_design, quantiles = 0.75, method = "constant")
+              
+              result_row <- tibble(
+                antimalarial_type = antimalarial_var,
+                outlet_type = outlet_var,
+                point_estimate = as.numeric(q50),  # Median price
+                lower_ci = as.numeric(q25),        # Q25
+                upper_ci = as.numeric(q75),        # Q75
+                sample_size = nrow(outlet_data_raw),
+                antimalarial_label = indicator_config$price_labels[[antimalarial_var]] %||% antimalarial_var,
+                outlet_label = indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+              )
+              
+              results <- bind_rows(results, result_row)
+            }
+          }
+          
+        } else {
+          # Strata analysis
+          strata_values <- unique(survey_data$variables[[group_vars[1]]])
+          strata_values <- strata_values[!is.na(strata_values)]
+          
+          for (strata_val in strata_values) {
+            outlet_data_raw <- survey_data$variables %>%
+              filter(!!sym(group_vars[1]) == strata_val,
+                     !!sym(outlet_var) == 1, 
+                     !!sym(antimalarial_var) == 1,
+                     !is.na(!!sym(price_var_name)))
+            
+            if (nrow(outlet_data_raw) > 0) {
+              if (requireNamespace("statar", quietly = TRUE)) {
+                percentiles <- statar::pctile(
+                  outlet_data_raw[[price_var_name]], 
+                  probs = c(0.25, 0.50, 0.75),
+                  wt = outlet_data_raw[[indicator_config$survey_weight]]
+                )
+                
+                result_row <- tibble(
+                  antimalarial_type = antimalarial_var,
+                  outlet_type = outlet_var,
+                  point_estimate = percentiles[2],  # Median price
+                  lower_ci = percentiles[1],        # Q25
+                  upper_ci = percentiles[3],        # Q75
+                  sample_size = nrow(outlet_data_raw),
+                  antimalarial_label = indicator_config$price_labels[[antimalarial_var]] %||% antimalarial_var,
+                  outlet_label = indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+                )
+                
+                result_row[[group_vars[1]]] <- as.character(strata_val)
+                results <- bind_rows(results, result_row)
+              } else {
+                # Fallback to survey package
+                subset_design <- subset(survey_data, 
+                                       !!sym(group_vars[1]) == strata_val &
+                                       !!sym(outlet_var) == 1 & 
+                                       !!sym(antimalarial_var) == 1 &
+                                       !is.na(!!sym(price_var_name)))
+                
+                price_formula <- as.formula(paste0("~", price_var_name))
+                q25 <- svyquantile(price_formula, subset_design, quantiles = 0.25, method = "constant")
+                q50 <- svyquantile(price_formula, subset_design, quantiles = 0.50, method = "constant")
+                q75 <- svyquantile(price_formula, subset_design, quantiles = 0.75, method = "constant")
+                
+                result_row <- tibble(
+                  antimalarial_type = antimalarial_var,
+                  outlet_type = outlet_var,
+                  point_estimate = as.numeric(q50),  # Median price
+                  lower_ci = as.numeric(q25),        # Q25
+                  upper_ci = as.numeric(q75),        # Q75
+                  sample_size = nrow(outlet_data_raw),
+                  antimalarial_label = indicator_config$price_labels[[antimalarial_var]] %||% antimalarial_var,
+                  outlet_label = indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+                )
+                
+                result_row[[group_vars[1]]] <- as.character(strata_val)
+                results <- bind_rows(results, result_row)
+              }
+            }
+          }
+        }
+        
+      }, error = function(e) {
+        message("Error processing ", antimalarial_var, " in ", outlet_var, ": ", e$message)
+      })
+    }
+  }
+  
+  return(results)
+}
+
+
+```
+
+```{r footnotes function}
+
+# Calculate footnotes (price data availability and incomplete interviews)
+calculate_footnotes <- function(data, strata1_var = NULL) {
+  
+  # Incomplete interview criteria (same as Stata)
+  incomplete_criteria <- c(203,204,205,207,208,303,304,305,307,308,309,310)
+  
+  price_var_name <- indicator_config$price_variable
+  
+  if (is.null(strata1_var)) {
+    # National counts
+    n_total <- sum(data$anyam == 1 & !is.na(data[[price_var_name]]), na.rm = TRUE)
+    
+    incomplete_count <- sum(data$finalintstat %in% incomplete_criteria & 
+                       data$anyam == 1 & data$nout == 1, na.rm = TRUE)
+    
+    missing_price <- sum(data$anyam == 1 & is.na(data[[price_var_name]]), na.rm = TRUE)
+    
+    return(paste0("Prices are per AETD of tablet formulations only. ",
+                  "Sample size = ", n_total, "; ",
+                  "N outlets not completing full interview = ", incomplete_count, "; ",
+                  "N products missing price data = ", missing_price))
+    
+  } else {
+    # Strata-specific counts
+    strata_levels <- unique(data[[strata1_var]])
+    strata_levels <- strata_levels[!is.na(strata_levels)]
+    
+    # Build sample sizes
+    sample_sizes <- c()
+    for (strata_val in strata_levels) {
+      n <- sum(data[[strata1_var]] == strata_val & 
+               data$anyam == 1 & 
+               !is.na(data[[price_var_name]]), na.rm = TRUE)
+      sample_sizes <- c(sample_sizes, paste0(strata_val, " = ", n))
+    }
+    
+    # Build incomplete interview counts
+    incomplete_counts <- c()
+    for (strata_val in strata_levels) {
+      incomplete <- sum(data[[strata1_var]] == strata_val &
+                   data$finalintstat %in% incomplete_criteria & 
+                   data$anyam == 1 & data$nout == 1, na.rm = TRUE)
+      incomplete_counts <- c(incomplete_counts, paste0(strata_val, " = ", incomplete))
+    }
+    
+    # Build missing price counts
+    missing_counts <- c()
+    for (strata_val in strata_levels) {
+      missing <- sum(data[[strata1_var]] == strata_val &
+                    data$anyam == 1 & 
+                    is.na(data[[price_var_name]]), na.rm = TRUE)
+      missing_counts <- c(missing_counts, paste0(strata_val, " = ", missing))
+    }
+    
+    return(paste0("Prices are per AETD of tablet formulations only. ",
+                  "Sample sizes: ", paste(sample_sizes, collapse = "; "), "; ",
+                  "N outlets not completing full interview: ", paste(incomplete_counts, collapse = "; "), "; ",
+                  "N products missing price data: ", paste(missing_counts, collapse = "; ")))
+  }
+}
+```
+
+```{r run_analysis, include=FALSE}
+# Initialize results storage
+results_list <- list()
+footnotes_list <- list()
+
+# 1. National level results
+national_results <- calculate_price_medians(survey_design)
+national_footnote <- calculate_footnotes(footnote_data)
+
+results_list[["national"]] <- national_results
+footnotes_list[["national"]] <- national_footnote
+
+# 2. Strata1 results (if available)
+if (has_strata1) {
+  strata1_results <- calculate_price_medians(survey_design, group_vars = "strata1")
+  
+  if (nrow(strata1_results) > 0) {
+    results_list[["strata1"]] <- strata1_results
+    strata1_footnotes <- calculate_footnotes(footnote_data, strata1_var = "strata1")
+    footnotes_list[["strata1"]] <- strata1_footnotes
+  }
+}
+
+# 3. Strata2 results (if available)  
+if (has_strata2) {
+  strata2_results <- calculate_price_medians(survey_design, group_vars = "strata2")
+  
+  if (nrow(strata2_results) > 0) {
+    results_list[["strata2"]] <- strata2_results
+    strata2_footnotes <- calculate_footnotes(footnote_data, strata1_var = "strata2")
+    footnotes_list[["strata2"]] <- strata2_footnotes
+  }
+}
+
+# 4. Cross-stratification results (if both strata available)
+if (cross_strata_possible) {
+  for (strata1_val in strata_info$strata1$values) {
+    # Filter to specific strata1 value for both analysis and footnotes
+    strata1_subset <- processed_data %>%
+      filter(strata1 == strata1_val)
+    
+    strata1_footnote_subset <- footnote_data %>%
+      filter(strata1 == strata1_val)
+    
+    if (nrow(strata1_subset) > 10) {  # Sufficient data
+      # Create survey design for this subset
+      strata1_survey <- strata1_subset %>%
+        filter(!is.na(!!sym(indicator_config$survey_weight))) %>%
+        as_survey_design(
+          ids = c4,
+          weights = !!sym(indicator_config$survey_weight),
+          strata = strata2,
+          fpc = fpc
+        )
+      
+      # Calculate prices by strata2 within this strata1 value
+      cross_results <- calculate_price_medians(strata1_survey, group_vars = "strata2")
+      
+      if (nrow(cross_results) > 0) {
+        # Add strata1 identifier
+        cross_results$strata1 <- strata1_val
+        results_list[[paste0("cross_", strata1_val)]] <- cross_results
+        
+        # Calculate footnotes for this cross-stratification
+        cross_footnotes <- calculate_footnotes(strata1_footnote_subset, strata1_var = "strata2")
+        footnotes_list[[paste0("cross_", strata1_val)]] <- cross_footnotes
+      }
+    }
+  }
+}
+```
+
+```{r export_excel, include=FALSE}
+# Use the standard create_excel_output function
+excel_success <- create_excel_output(
+  results_list = results_list,
+  footnotes_list = footnotes_list, 
+  indicator_config = indicator_config,
+  country = country,
+  year = year,
+  include_antimalarial_col = TRUE
+)
+
+if (excel_success) {
+  cat("Excel file created successfully\n")
+} else {
+  cat("Warning: Excel file creation encountered issues\n")
+}
+```
+
+\newpage
+
+## Figures
+
+### Figure 1: Median ACT Prices by ACT Type (National)
+
+```{r figure_act_prices, fig.width=12, fig.height=8}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  available_act_types <- intersect(indicator_config$act_types, 
+                                  unique(results_list[["national"]]$antimalarial_type))
+  
+  national_act_prices <- results_list[["national"]] %>%
+    filter(antimalarial_type %in% available_act_types) %>%
+    group_by(antimalarial_type, antimalarial_label) %>%
+    summarise(
+      median_price = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      q25 = weighted.mean(lower_ci, sample_size, na.rm = TRUE),
+      q75 = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(national_act_prices) > 0) {
+    ggplot(national_act_prices, aes(x = fct_reorder(antimalarial_label, median_price), 
+                                    y = median_price)) +
+      geom_col(fill = "#2171b5", alpha = 0.8) +
+      geom_errorbar(aes(ymin = q25, ymax = q75), width = 0.3) +
+      coord_flip() +
+      labs(
+        title = "Median ACT Prices by ACT Type (National Level)",
+        x = "ACT Type",
+        y = "Median Price per AETD (USD)",
+        caption = "Error bars show interquartile range (Q25-Q75)"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        axis.text = element_text(size = 12)
+      ) +
+      scale_y_continuous(labels = scales::dollar_format(), 
+                        expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+### Figure 2: Median Any ACT Price by Outlet Type (National)
+
+```{r figure_anyact_outlet, fig.width=12, fig.height=8}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  national_anyact <- results_list[["national"]] %>%
+    filter(antimalarial_type == "anyact")
+  
+  if (nrow(national_anyact) > 0) {
+    ggplot(national_anyact, aes(x = fct_reorder(outlet_label, point_estimate), 
+                                y = point_estimate)) +
+      geom_col(fill = "#238b45", alpha = 0.8) +
+      geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.3) +
+      coord_flip() +
+      labs(
+        title = "Median Any ACT Price by Outlet Type (National Level)",
+        x = "Outlet Type",
+        y = "Median Price per AETD (USD)",
+        caption = "Error bars show interquartile range (Q25-Q75)"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        axis.text = element_text(size = 12)
+      ) +
+      scale_y_continuous(labels = scales::dollar_format(),
+                        expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+`r if(has_strata1) "### Figure 3: ACT Prices by ACT Type and Strata1"`
+
+```{r figure_act_prices_strata1, fig.width=12, fig.height=8}
+if ("strata1" %in% names(results_list) && nrow(results_list[["strata1"]]) > 0) {
+  
+  available_act_types <- intersect(indicator_config$act_types, 
+                                  unique(results_list[["strata1"]]$antimalarial_type))
+  
+  strata1_act_prices <- results_list[["strata1"]] %>%
+    filter(antimalarial_type %in% available_act_types) %>%
+    group_by(antimalarial_type, antimalarial_label, strata1) %>%
+    summarise(
+      median_price = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      q25 = weighted.mean(lower_ci, sample_size, na.rm = TRUE),
+      q75 = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(strata1_act_prices) > 0) {
+    ggplot(strata1_act_prices, aes(x = fct_reorder(antimalarial_label, median_price), 
+                                   y = median_price, fill = strata1)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = q25, ymax = q75), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      coord_flip() +
+      labs(
+        title = "Median ACT Prices by ACT Type and Strata1",
+        x = "ACT Type",
+        y = "Median Price per AETD (USD)",
+        fill = "Strata1",
+        caption = "Error bars show interquartile range (Q25-Q75)"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+      ) +
+      scale_fill_brewer(type = "qual", palette = "Set1") +
+      scale_y_continuous(labels = scales::dollar_format(),
+                        expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+`r if(has_strata2) "### Figure 4: ACT Prices by ACT Type and Strata2"`
+
+```{r figure_act_prices_strata2, fig.width=12, fig.height=8}
+if ("strata2" %in% names(results_list) && nrow(results_list[["strata2"]]) > 0) {
+  
+  available_act_types <- intersect(indicator_config$act_types, 
+                                  unique(results_list[["strata2"]]$antimalarial_type))
+  
+  strata2_act_prices <- results_list[["strata2"]] %>%
+    filter(antimalarial_type %in% available_act_types) %>%
+    group_by(antimalarial_type, antimalarial_label, strata2) %>%
+    summarise(
+      median_price = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      q25 = weighted.mean(lower_ci, sample_size, na.rm = TRUE),
+      q75 = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(strata2_act_prices) > 0) {
+    ggplot(strata2_act_prices, aes(x = fct_reorder(antimalarial_label, median_price), 
+                                   y = median_price, fill = strata2)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = q25, ymax = q75), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      coord_flip() +
+      labs(
+        title = "Median ACT Prices by ACT Type and Strata2",
+        x = "ACT Type",
+        y = "Median Price per AETD (USD)",
+        fill = "Strata2",
+        caption = "Error bars show interquartile range (Q25-Q75)"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+      ) +
+      scale_fill_brewer(type = "qual", palette = "Set2") +
+      scale_y_continuous(labels = scales::dollar_format(),
+                        expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+`r if(has_strata2) "### Figure 5: Any ACT Price by Outlet Type and Strata2"`
+
+```{r figure_anyact_outlet_strata2, fig.width=12, fig.height=8}
+if ("strata2" %in% names(results_list) && nrow(results_list[["strata2"]]) > 0) {
+  
+  strata2_anyact <- results_list[["strata2"]] %>%
+    filter(antimalarial_type == "anyact")
+  
+  if (nrow(strata2_anyact) > 0) {
+    ggplot(strata2_anyact, aes(x = fct_reorder(outlet_label, point_estimate), 
+                               y = point_estimate, fill = strata2)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      coord_flip() +
+      labs(
+        title = "Median Any ACT Price by Outlet Type and Strata2",
+        x = "Outlet Type",
+        y = "Median Price per AETD (USD)",
+        fill = "Strata2",
+        caption = "Error bars show interquartile range (Q25-Q75)"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+      ) +
+      scale_fill_brewer(type = "qual", palette = "Set2") +
+      scale_y_continuous(labels = scales::dollar_format(),
+                        expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+`r if(cross_strata_possible) "### Figure 6: Any ACT Price by Outlet Type - Cross-Stratification"`
+
+```{r figure_anyact_cross_strata, fig.width=14, fig.height=10}
+if (cross_strata_possible) {
+  cross_results <- names(results_list)[grepl("^cross_", names(results_list))]
+  
+  if (length(cross_results) > 0) {
+    # Combine all cross-stratification results for plotting
+    all_cross_data <- tibble()
+    
+    for (cross_name in cross_results) {
+      cross_data <- results_list[[cross_name]] %>%
+        filter(antimalarial_type == "anyact") %>%
+        mutate(strata1_group = gsub("cross_", "", cross_name))
+      all_cross_data <- bind_rows(all_cross_data, cross_data)
+    }
+    
+    if (nrow(all_cross_data) > 0) {
+      ggplot(all_cross_data, aes(x = fct_reorder(outlet_label, point_estimate), 
+                                y = point_estimate, fill = strata2)) +
+        geom_col(position = "dodge", alpha = 0.8) +
+        geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                      position = position_dodge(width = 0.9), width = 0.2) +
+        facet_wrap(~strata1_group, scales = "fixed") +
+        coord_flip() +
+        labs(
+          title = "Median Any ACT Price by Outlet Type - Cross-Stratification",
+          x = "Outlet Type",
+          y = "Median Price per AETD (USD)",
+          fill = "Strata2",
+          caption = "Error bars show interquartile range (Q25-Q75)"
+        ) +
+        theme_minimal(base_size = 14) +
+        theme(
+          plot.title = element_text(face = "bold"),
+          legend.position = "bottom",
+          strip.text = element_text(face = "bold")
+        ) +
+        scale_fill_brewer(type = "qual", palette = "Set1") +
+        scale_y_continuous(labels = scales::dollar_format(),
+                          expand = expansion(mult = c(0, 0.15)))
+    }
+  }
+}
+```
+
+\newpage
+
+## Tables
+
+### Table 1: National Level Results - Price by Antimalarial × Outlet Matrix
+
+```{r table_national_price, results='asis'}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Create comprehensive table with median prices as values
+  price_matrix <- results_list[["national"]] %>%
+    select(antimalarial_label, outlet_label, point_estimate) %>%
+    pivot_wider(names_from = outlet_label, values_from = point_estimate, values_fill = NA) %>%
+    mutate(across(where(is.numeric), ~round(., 2)))
+  
+  table_output <- knitr::kable(price_matrix, format = "markdown",
+                              caption = "Median Price per AETD (USD)")
+  cat(table_output, sep = "\n")
+  cat("\n*", footnotes_list[["national"]], "*\n\n")
+  
+} else {
+  cat("**No national level data available**\n\n")
+}
+```
+
+\newpage
+
+## Technical Notes
+
+**Survey Design:** Complex sampling with outlet weights (`wt_alloutlet`), cluster sampling (c4), stratification (strata1), and finite population correction (fpc).
+
+**Population Filter:** Analysis limited to:  
+- Tablet formulations only (`a3 == 1`)  
+- Non-booster samples (`booster == 0`)  
+- Counted products (`countprod == 1`)  
+- Products with non-missing price data  
+
+**Price Variable:** `usppriceperaetddc` - Sales price per Adult Equivalent Treatment Dose in USD
+
+**Statistical Method:** Survey-weighted quantiles (25th, 50th, and 75th percentiles) using `statar::pctile()` for weighted percentiles, with fallback to `survey` package's `svyquantile()`.
+
+**Antimalarial Products:** Uses the same comprehensive list as Indicators 3.1 and 4.1, including ACTs, non-artemisinin antimalarials, and treatments for severe malaria.
+
+**Results Structure:**  
+- **National:** Overall price medians across all outlets with price data  
+- **Strata1:** Price medians by primary stratification variable (if present and varies)  
+- **Strata2:** Price medians by secondary stratification variable (if present and varies)  
+- **Cross-stratification:** Price medians by strata2 within each level of strata1 (if both strata present)  
+
+**Flexible Stratification:** Unlike the original Stata code which hardcoded urban/rural categories, this R version:  
+- Uses generic `strata1` and `strata2` variable names  
+- Automatically detects available strata values  
+- Adapts to whatever stratification structure exists in your data  
+- Works with any stratification scheme (e.g., region, province, urban/rural)  
+
+**Excel Output:** Results exported to Excel workbook using common function with standardized column structure. Median prices appear as "Point Estimate" and quartiles as "Lower CI"/"Upper CI" for consistency with other indicators.
+
+**Footnotes:** Include counts of:  
+- Outlets that met screening criteria but did not complete interviews  
+- Antimalarial products audited but missing price information  
+
+**Data Standardization:** Results use common column structure (`antimalarial_type`, `point_estimate`, `lower_ci`, `upper_ci`) where:  
+- `point_estimate` = median price per AETD (USD)  
+- `lower_ci` = 25th percentile (Q25)  
+- `upper_ci` = 75th percentile (Q75)  
+
+**Key Differences from Volume Indicators (3.1 and 4.1):**  
+- Analysis focuses on **price** rather than volume  
+- Only includes **tablet formulations** (filtered by a3 == 1)  
+- Uses `usppriceperaetddc` as outcome variable instead of `volume`  
+- Footnotes focus on missing price data rather than missing volume data  
+
+---
+
+**Report generated:** `r format(Sys.time(), '%B %d, %Y at %I:%M %p')`

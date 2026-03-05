@@ -1,0 +1,632 @@
+---
+title: "ACTwatch Indicator 1.1 - Market Composition among Antimalarial-Stocking Outlets"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output: 
+  word_document:
+    toc: false
+    toc_depth: 2
+    reference_docx: null
+---
+
+## Indicator Definition
+
+**Indicator Group:** Market Composition among antimalarial-stocking outlets
+
+**Description:** The distribution (proportion) of outlets of a given type among outlets with at least one antimalarial in stock on the day of the survey
+
+**Numerator:** Number of a given type of outlet with any antimalarial in stock at the time of the survey visit
+
+**Denominator:** Number of outlets with any antimalarial in stock on the day of the survey visit
+
+**Disaggregation:** By outlet type and strata; additional disaggregation by cross-stratification if possible
+
+**Data Source:** Outlet data
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, 
+                      fig.width = 10, fig.height = 6)
+
+
+library(tidyverse)
+library(survey)
+library(openxlsx)
+library(forcats)
+library(here)
+library(data.table)
+
+
+# Set parameters
+if (!exists("country")) stop("Global variable 'country' not found")
+if (!exists("year")) stop("Global variable 'year' not found") 
+
+# Configuration matching the indicator config
+indicator_config <- list(
+  indicator_id = "1.1",
+  title = "Market Composition among Antimalarial-Stocking Outlets",
+  description = "Distribution (proportion) of outlets of a given type among outlets with at least one antimalarial in stock",
+  
+  # Analysis settings
+  dataset = "outlet",
+  analysis_type = "market_composition",  # Add this line
+  survey_weight = "wt_marketshare",
+  population_filter = quote(st_anyam == 1 & booster == 0),
+  
+  # Outlet types to include 
+  outlet_dummies = c("private_nonprofit", "private_forprofit", "pharmacy",
+                    "laboratory",  "drug_store", "total_informal"),
+  
+  # Outlet labels for better display
+  outlet_labels = list(
+    "private_nonprofit" = "Private Not-for-Profit",
+    "private_forprofit" = "Private For-Profit", 
+    "pharmacy" = "Pharmacy",
+    "drug_store" = "Drug Store",
+    "laboratory" = "Laboratory",
+    "total_informal" = "Informal (Total)"
+  ),
+  
+  # Output settings
+  file_suffix = "Market Composition among antimalarial-stocking outlets"
+)
+```
+
+```{r load_data, include=FALSE}
+# Load outlet data
+data_file <- here("Data", "Final data", 
+                  paste0(country, "_", year, "_outlet_data.csv"))
+
+if (!file.exists(data_file)) {
+  stop("Data file not found: ", data_file)
+}
+
+outlet_data <- fread(data_file) %>%
+  # Ensure strata variables are character
+  mutate(across(any_of(c("strata1", "strata2")), as.character)) %>%
+  # Drop if outlet category information is missing (following Stata logic)
+  filter(!is.na(outcat2)) %>% 
+  # Clean up blank but non-missing strata values
+  mutate(
+    strata1 = dplyr::na_if(strata1, ""),      # convert blank strings to NA
+    strata2 = dplyr::na_if(strata2, ""))     # same for strata2
+```
+
+```{r data_processing, include=FALSE}
+# Following Stata logic: ensure only outlets of specified types are included
+processed_data <- outlet_data %>%
+  # Create temp_tot to identify outlets in our analysis (following Stata logic)
+  rowwise() %>%
+  mutate(
+    temp_tot = if_else(
+      any(c_across(all_of(indicator_config$outlet_dummies)) == 1, na.rm = TRUE), 
+      1, 0
+    )
+  ) %>%
+  ungroup() %>%
+  # Drop outlets not in specified types (following Stata: drop if temp_tot==0)
+  filter(temp_tot == 1) %>%
+  select(-temp_tot) %>%
+  # Recode outlet variables (following Stata: recode `x'(.=0) if st_anyAM==1)
+  mutate(
+    across(all_of(indicator_config$outlet_dummies), 
+           ~ifelse(is.na(.) & st_anyam == 1, 0, .))
+  ) %>%
+  # Apply population filter
+  filter(!!indicator_config$population_filter)
+
+# Detect strata structure
+strata_info <- list()
+if ("strata1" %in% names(processed_data) && 
+    length(unique(na.omit(processed_data$strata1))) > 1) {
+  strata1_values <- unique(na.omit(processed_data$strata1))
+  # Remove empty strings and whitespace
+  strata1_values <- strata1_values[strata1_values != "" & !is.na(trimws(strata1_values))]
+  if (length(strata1_values) > 1) {
+    strata_info$strata1 <- list(variable = "strata1", values = strata1_values)
+  }
+}
+
+if ("strata2" %in% names(processed_data) && 
+    length(unique(na.omit(processed_data$strata2))) > 1) {
+  strata2_values <- unique(na.omit(processed_data$strata2))
+  # Remove empty strings and whitespace  
+  strata2_values <- strata2_values[strata2_values != "" & !is.na(trimws(strata2_values))]
+  if (length(strata2_values) > 1) {
+    strata_info$strata2 <- list(variable = "strata2", values = strata2_values)
+  }
+}
+
+has_strata1 <- "strata1" %in% names(strata_info)
+has_strata2 <- "strata2" %in% names(strata_info)
+cross_strata_possible <- has_strata1 && has_strata2
+```
+
+```{r survey_setup, include=FALSE}
+# Setup survey design (following Stata: svyset c4 [pweight=wt_marketShare], strata(strata) fpc(fpc))
+survey_design <- processed_data %>%
+  filter(!is.na(!!sym(indicator_config$survey_weight))) %>%
+  as_survey_design(
+    ids = c4,
+    weights = !!sym(indicator_config$survey_weight),
+    strata = strata1,  # Using strata1 as primary design strata
+    fpc = fpc
+  )
+```
+
+```{r analysis_functions, include=FALSE}
+calculate_market_composition <- function(survey_data, group_vars = NULL) {
+  
+  results <- tibble()
+  
+  for (outlet_var in indicator_config$outlet_dummies) {
+    if (outlet_var %in% names(survey_data$variables)) {
+      
+      tryCatch({
+        if (is.null(group_vars)) {
+          # National analysis using svyciprop for better CI estimation
+          prop_result <- svyciprop(as.formula(paste0("~", outlet_var)), 
+                                  survey_data,
+                                  method = "logit")
+          
+          ci_result <- confint(prop_result, method = "logit")
+          total_result <- svytotal(as.formula(paste0("~", outlet_var)), survey_data)
+          
+          result_row <- tibble(
+            outlet_type = outlet_var,
+            point_estimate = as.numeric(prop_result) * 100,
+            lower_ci = ci_result[1] * 100,
+            upper_ci = ci_result[2] * 100,
+            n_weighted = as.numeric(total_result),
+            sample_size = nrow(survey_data$variables),
+            outlet_label = indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+          )
+          
+          results <- bind_rows(results, result_row)
+          
+        } else {
+          # Strata analysis using svyciprop
+          strata_values <- unique(survey_data$variables[[group_vars[1]]])
+          strata_values <- strata_values[!is.na(strata_values)]
+          
+          for (strata_val in strata_values) {
+            subset_condition <- survey_data$variables[[group_vars[1]]] == strata_val & 
+                               !is.na(survey_data$variables[[group_vars[1]]])
+            
+            if (sum(subset_condition) > 5) {  # Only if sufficient observations
+              subset_design <- subset(survey_data, subset_condition)
+              
+              prop_result <- svyciprop(as.formula(paste0("~", outlet_var)), 
+                                      subset_design,
+                                      method = "logit")
+              
+              ci_result <- confint(prop_result, method = "logit")
+              total_result <- svytotal(as.formula(paste0("~", outlet_var)), subset_design)
+              
+              result_row <- tibble(
+                outlet_type = outlet_var,
+                point_estimate = as.numeric(prop_result) * 100,
+                lower_ci = ci_result[1] * 100,
+                upper_ci = ci_result[2] * 100,
+                n_weighted = as.numeric(total_result),
+                sample_size = sum(subset_condition),
+                outlet_label = indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+              )
+              
+              result_row[[group_vars[1]]] <- as.character(strata_val)
+              results <- bind_rows(results, result_row)
+            }
+          }
+        }
+        
+      }, error = function(e) {
+        message("Error processing ", outlet_var, ": ", e$message)
+      })
+    }
+  }
+  
+  return(results)
+}
+
+calculate_footnotes <- function(data, strata1_var = NULL, strata2_var = NULL) {
+  
+  # Create a temporary column to flag "incomplete" outlets
+  data <- data %>%
+    dplyr::mutate(incomplete = (finalintstat %in% c(203,204,205,207,208,303,304,305,307,308,309,310)) & st_anyam == 1)
+  
+  total_sample <- nrow(data)
+  total_incomplete <- sum(data$incomplete, na.rm = TRUE)
+  
+  # Case 1: National
+  if (is.null(strata1_var) & is.null(strata2_var)) {
+    return(glue::glue(
+      "Sample size = {total_sample}; ",
+      "Number of outlets that met screening criteria for a full interview ",
+      "but did not complete the interview with any AM in stock = {total_incomplete}"
+    ))
+  }
+  
+  # Case 2: One-level strata
+  if (is.null(strata2_var) | is.null(strata1_var)) {
+    strata_var <- if (!is.null(strata1_var)) strata1_var else strata2_var
+    
+    strata_summary <- data %>%
+      filter(!is.na(.data[[strata_var]])) %>% 
+      dplyr::group_by(.data[[strata_var]]) %>%
+      dplyr::summarise(
+        incomplete = sum(incomplete, na.rm = TRUE),
+        n = dplyr::n(),
+        .groups = "drop"
+      )
+    
+    sizes <- paste0(strata_summary[[strata_var]], " = ", strata_summary$n, collapse = "; ")
+    fails <- paste0(strata_summary[[strata_var]], " = ", strata_summary$incomplete, collapse = "; ")
+    
+    return(glue::glue(
+      "Sample sizes: {sizes}; ",
+      "Number of outlets that met screening criteria for a full interview ",
+      "but did not complete the interview with any AM in stock: {fails}"
+    ))
+  }
+  
+  # Case 3: Cross-strata (collapsed to strata1 totals)
+  if (!is.null(strata1_var) & !is.null(strata2_var)) {
+    strata1_summary <- data %>%
+      filter(!is.na(.data[[strata1_var]])) %>% 
+      dplyr::group_by(.data[[strata1_var]]) %>%
+      dplyr::summarise(
+        incomplete = sum(incomplete, na.rm = TRUE),
+        n = dplyr::n(),
+        .groups = "drop"
+      )
+    
+    footnotes <- strata1_summary %>%
+      dplyr::mutate(note = glue::glue(
+        "Sample size = {n}; ",
+        "Number of outlets that met screening criteria for a full interview ",
+        "but did not complete the interview with any AM in stock = {incomplete}"
+      )) %>%
+      dplyr::pull(note)
+    
+    names(footnotes) <- strata1_summary[[strata1_var]]
+    return(footnotes)
+  }
+}
+```
+
+```{r run_analysis, include=FALSE}
+# Initialize results storage
+results_list <- list()
+footnotes_list <- list()
+
+# 1. National level results
+national_results <- calculate_market_composition(survey_design)
+national_footnote <- calculate_footnotes(processed_data)
+
+results_list[["national"]] <- national_results
+footnotes_list[["national"]] <- national_footnote
+
+# 2. Strata1 results (always present)
+if (has_strata1) {
+ strata1_results <- calculate_market_composition(survey_design, group_vars = "strata1")
+ 
+ if (nrow(strata1_results) > 0) {
+   results_list[["strata1"]] <- strata1_results
+   footnotes_list[["strata1"]] <- calculate_footnotes(
+     processed_data, 
+     strata1_var = strata_info$strata1$variable
+   )
+ }
+}
+
+# 3. Strata2 results (if present)
+if (has_strata2) {
+ strata2_results <- calculate_market_composition(survey_design, group_vars = "strata2")
+ 
+ if (nrow(strata2_results) > 0) {
+   results_list[["strata2"]] <- strata2_results
+   footnotes_list[["strata2"]] <- calculate_footnotes(
+     processed_data,
+     strata2_var = strata_info$strata2$variable
+   )
+ }
+}
+
+# 4. Cross-stratification results (if both strata present)
+if (cross_strata_possible) {
+  # Get all combinations of strata1 and strata2
+  strata1_values <- unique(survey_design$variables$strata1)
+  strata1_values <- strata1_values[!is.na(strata1_values)]
+  strata2_values <- unique(survey_design$variables$strata2) 
+  strata2_values <- strata2_values[!is.na(strata2_values)]
+  
+  all_cross_results <- tibble()
+  
+  # Calculate results for each strata1 x strata2 combination
+  for (strata1_val in strata1_values) {
+    for (strata2_val in strata2_values) {
+      # Create subset condition for this combination
+      subset_condition <- survey_design$variables$strata1 == strata1_val & 
+                         survey_design$variables$strata2 == strata2_val &
+                         !is.na(survey_design$variables$strata1) &
+                         !is.na(survey_design$variables$strata2)
+      
+      if (sum(subset_condition) > 5) {  # Only if sufficient observations
+        subset_design <- subset(survey_design, subset_condition)
+        
+        # Calculate for this specific combination
+        combo_results <- calculate_market_composition(subset_design)
+        
+        if (nrow(combo_results) > 0) {
+          # Add strata columns
+          combo_results$strata1 <- strata1_val
+          combo_results$strata2 <- strata2_val
+          all_cross_results <- bind_rows(all_cross_results, combo_results)
+        }
+      }
+    }
+  }
+  
+  if (nrow(all_cross_results) > 0) {
+    # Split by strata1 values for separate tables
+    for (strata1_val in strata1_values) {
+      strata1_data <- all_cross_results %>% filter(strata1 == strata1_val)
+      if (nrow(strata1_data) > 0) {
+        cross_id <- paste0("cross_", strata1_val)
+        results_list[[cross_id]] <- strata1_data
+        
+        processed_strata1 <- processed_data %>% filter(strata1 == strata1_val)
+        footnotes_list[[cross_id]] <- calculate_footnotes(processed_strata1)
+      }
+    }
+  }
+}
+
+```
+
+```{r create_excel_function}
+# Create Excel output with wide format by outlet type  
+source(here("Scripts", "3_Analysis", "create_excel_function.R"))
+
+excel_success <- create_excel_output(
+  results_list = results_list,
+  footnotes_list = footnotes_list, 
+  indicator_config = indicator_config,
+  country = country,
+  year = year,
+  include_antimalarial_col = FALSE
+)
+
+if (!excel_success) {
+  message("Incomplete to create Excel file")
+} 
+```
+
+```{r analysis_summary, results='asis'}
+cat("## Analysis Summary\n\n")
+cat("**Data Processing:**\n\n")
+cat("- Original outlets surveyed:", nrow(outlet_data), "\n")
+cat("- Outlets included in analysis:", nrow(processed_data), "\n")
+cat("- Survey design: Complex sampling with market share weights\n\n")
+
+cat("**Stratification:**\n\n")
+if (length(strata_info) > 0) {
+  for (stratum_name in names(strata_info)) {
+    stratum <- strata_info[[stratum_name]]
+    cat("-", stratum_name, "(", length(stratum$values), "levels):", 
+        paste(stratum$values, collapse = ", "), "\n")
+  }
+  if (cross_strata_possible) {
+    cat("- Cross-stratification: Available\n")
+  }
+  cat("\n")
+} else {
+  cat("- No stratification variables available\n\n")
+}
+```
+
+
+## Results
+
+```{r figure_size_presets}
+overall_base_size = 18
+point_estimate_size = 4
+```
+
+### Figure 1: National Market Composition
+
+```{r figure_national, fig.width=10, fig.height=6}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  chart_data <- results_list[["national"]] %>%
+    arrange(desc(point_estimate)) %>%
+    mutate(outlet_label = fct_reorder(outlet_label, point_estimate))
+  
+  ggplot(chart_data, aes(x = outlet_label, y = point_estimate)) +
+    geom_col(fill = "steelblue", alpha = 0.8) +
+    geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                  width = 0.2, color = "black") +
+    geom_text(aes(y = upper_ci + 2, 
+                  label = paste0("(", round(point_estimate, 1), "%)")),
+              hjust = 0, size = point_estimate_size, color = "black") +
+    coord_flip() +
+    labs(
+      title = str_wrap("Market Composition among Antimalarial-Stocking Outlets - National", width = 50),
+      x = "Outlet Type",
+      y = "Percentage of Total Market (%)",
+      caption = "Error bars show 95% confidence intervals. Values in parentheses show point estimates."
+    ) +
+    theme_minimal(base_size = overall_base_size) +
+    theme(
+      plot.title = element_text(face = "bold")
+    ) +
+    scale_y_continuous(limits = c(0, 109), expand = c(0, 0))
+  
+} else {
+  cat("No national data available for charting")
+}
+```
+
+### Figure 2: Market Composition by Strata1
+
+```{r figure_strata1, fig.width=12, fig.height=8}
+if ("strata1" %in% names(results_list) && nrow(results_list[["strata1"]]) > 0) {
+  
+  strata1_data <- results_list[["strata1"]]
+  
+  ggplot(strata1_data, aes(x = fct_reorder(outlet_label, point_estimate), 
+                          y = point_estimate, fill = strata1)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                  position = position_dodge(width = 0.9), width = 0.2) +
+    geom_text(aes(y = upper_ci + 2, 
+              label = paste0("(",round(point_estimate, 1), "%)")),
+              hjust = 0, size = point_estimate_size, position = position_dodge(width = 0.9)) +
+    coord_flip() +
+    labs(
+      title = str_wrap("Market Composition by Outlet Type and Strata1", width=50),
+      x = "Outlet Type",
+      y = "Percentage of Market (%)",
+      fill = "Strata1",
+      caption = "Error bars show 95% confidence intervals"
+    ) +
+    theme_minimal(base_size = overall_base_size) +
+    theme(
+      plot.title = element_text(size = rel(1.1), face = "bold"),
+      axis.text = element_text(size = rel(0.9)),
+      axis.title = element_text(size = rel(1.0)),
+      legend.position = "bottom") +
+    scale_fill_brewer(type = "qual", palette = "Set1") +
+    scale_y_continuous(limits = c(0, 109), expand = c(0, 0))
+}
+```
+
+`r if(has_strata2) "### Figure 3: Market Composition by Strata2"`
+
+```{r figure_strata2, fig.width=12, fig.height=8}
+if ("strata2" %in% names(results_list) && nrow(results_list[["strata2"]]) > 0) {
+  
+  strata2_data <- results_list[["strata2"]]
+  
+  ggplot(strata2_data, aes(x = fct_reorder(outlet_label, point_estimate), 
+                          y = point_estimate, fill = strata2)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                  position = position_dodge(width = 0.9), width = 0.2) +
+    geom_text(aes(y = upper_ci + 2, 
+              label = paste0("(",round(point_estimate, 1), "%)")),
+              hjust = 0, size = point_estimate_size, position = position_dodge(width = 0.9)) +
+    coord_flip() +
+    labs(
+      title = str_wrap("Market Composition by Outlet Type and Strata2", width=50),
+      x = "Outlet Type", 
+      y = "Percentage of Market (%)",
+      fill = "Strata2",
+      caption = "Error bars show 95% confidence intervals"
+    ) +
+    theme_minimal(base_size = overall_base_size) +
+    theme(
+      plot.title = element_text(size = rel(1.1), face = "bold"),
+      axis.text = element_text(size = rel(0.9)),
+      axis.title = element_text(size = rel(1.0)),
+      legend.position = "bottom") +
+    scale_fill_brewer(type = "qual", palette = "Set1") +
+    scale_y_continuous(limits = c(0, 109), expand = c(0,0)) 
+}
+```
+
+`r if(cross_strata_possible) "### Figure 4: Market Composition by Cross-Stratification"`
+
+```{r figure_cross_strata, fig.width=14, fig.height=10}
+if (cross_strata_possible) {
+  cross_results <- names(results_list)[grepl("^cross_", names(results_list))]
+  
+  if (length(cross_results) > 0) {
+    # Combine all cross-stratification results for plotting
+    all_cross_data <- tibble()
+    
+    for (cross_name in cross_results) {
+      cross_data <- results_list[[cross_name]] %>%
+        mutate(strata1_group = gsub("cross_", "", cross_name))
+      all_cross_data <- bind_rows(all_cross_data, cross_data)
+    }
+    
+    if (nrow(all_cross_data) > 0) {
+      ggplot(all_cross_data, aes(x = fct_reorder(outlet_label, point_estimate), 
+                                y = point_estimate, fill = strata2)) +
+        geom_col(position = "dodge", alpha = 0.8) +
+        geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                      position = position_dodge(width = 0.9), width = 0.2) +
+        geom_text(aes(y = upper_ci + 2, 
+              label = paste0("(",round(point_estimate, 1), "%)")),
+              hjust = 0, size = point_estimate_size, position = position_dodge(width = 0.9)) +
+        facet_wrap(~strata1_group, scales = "fixed") +
+        coord_flip() +
+        labs(
+          title = str_wrap("Market Composition by Outlet Type and Cross-Stratification", width=50),
+          x = "Outlet Type", 
+          y = "Percentage of Market (%)",
+          fill = "Strata2",
+          caption = "Error bars show 95% confidence intervals"
+        ) +
+        theme_minimal(base_size = overall_base_size) +
+        theme(
+          plot.title = element_text(size = rel(1.1), face = "bold"),
+          axis.text = element_text(size = rel(0.9)),
+          axis.title = element_text(size = rel(1.0)),
+          legend.position = "bottom",
+              strip.text = element_text(face = "bold")) +
+        scale_fill_brewer(type = "qual", palette = "Set1") +
+        scale_y_continuous(limits = c(0, 109), expand = c(0, 0))
+  }
+  }
+}
+```
+
+
+#### Table 1: National Level Results
+
+```{r table_national, results='asis'}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  table_data <- results_list[["national"]] %>%
+    arrange(desc(point_estimate)) %>%
+    select(
+      "Outlet Type" = outlet_label,
+      "Point Estimate (%)" = point_estimate,
+      "Lower CI (%)" = lower_ci,
+      "Upper CI (%)" = upper_ci
+    ) %>%
+    mutate(
+      across(contains("%"), ~round(., 2))
+    )
+  
+  table_output <- knitr::kable(table_data, format = "markdown")
+  cat(table_output, sep = "\n")
+  cat("\n")
+  cat("*", footnotes_list[["national"]], "*\n\n")
+  
+} else {
+  cat("**No national level data available**\n\n")
+}
+```
+
+\newpage 
+
+## Technical Notes
+
+**Survey Design:** Complex sampling with market share weights (`wt_marketshare`), cluster sampling (c4), stratification (strata1), and finite population correction (fpc).
+
+**Population Filter:** Analysis limited to outlets with at least one antimalarial in stock (`st_anyam == 1`) and excluding booster samples (`booster == 0`).
+
+**Statistical Method:** Survey-weighted proportions with 95% confidence intervals using proper subpopulation analysis methods.
+
+**Results Structure:**  
+- **National:** Overall market composition across all outlets  
+- **Strata1:** Market composition by primary stratification variable (always present)  
+- **Strata2:** Market composition by secondary stratification variable (if present and has variation)    
+- **Cross-stratification:** Market composition by strata2 within each level of strata1 (if both strata present)  
+
+**Excel Output:** Results exported to Excel workbook with separate sheets for each analysis level.
+
+---
+
+**Report generated:** `r format(Sys.time(), '%B %d, %Y at %I:%M %p')`

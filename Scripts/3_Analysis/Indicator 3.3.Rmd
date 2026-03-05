@@ -1,0 +1,831 @@
+---
+title: "ACTwatch Indicator 3.3 - Median Sales Volume of Malaria Blood Tests"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output: 
+  word_document:
+    toc: false
+    toc_depth: 2
+    reference_docx: null
+---
+
+## Indicator Definition
+
+**Indicator Group:** Volume - Median diagnostic sales volumes all outlets
+
+**Description:** The median sales volume of malaria blood test products by test type and outlet type
+
+**Numerator:** Median volume of sales for a specific diagnostic product/category
+
+**Denominator:** All outlets with volume data available for that product/category
+
+**Disaggregation:** By diagnostic type and outlet type; additional disaggregation by strata if available
+
+**Data Source:** Product data (long format) - RDT/diagnostic dataset
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, 
+                      fig.width = 12, fig.height = 8)
+
+library(tidyverse)
+library(survey)
+library(openxlsx)
+library(forcats)
+library(here)
+library(data.table)
+
+# Set parameters
+if (!exists("country")) stop("Global variable 'country' not found")
+if (!exists("year")) stop("Global variable 'year' not found") 
+
+
+# Configuration matching the Stata analysis structure
+indicator_config <- list(
+  indicator_id = "3.3",
+  title = "Median Sales Volume of Malaria Blood Tests", 
+  description = "Median sales volume of diagnostic products by type and outlet",
+  
+  # Analysis settings
+  dataset = "product", # Product data in long format (RDT/diagnostic data)
+  analysis_type = "volume",
+  survey_weight = "wt_alloutlet", # Standard outlet weight for volume analysis
+  population_filter = quote(booster == 0 & !is.na(volume)), # Products with volume data, no booster
+  
+  # Outlet types (matching Stata outvars1)
+  outlet_dummies = c("private_nonprofit", "private_forprofit", "pharmacy",
+                    "laboratory", "drug_store", "total_informal", "total_retail", "wholesale"),
+  outlet_labels = list(
+    "private_nonprofit" = "Private Not-for-Profit",
+    "private_forprofit" = "Private For-Profit", 
+    "pharmacy" = "Pharmacy",
+    "laboratory" = "Laboratory", 
+    "drug_store" = "Drug Store",
+    "total_informal" = "Informal (Total)",
+    "total_retail" = "Retail (Total)",
+    "wholesale" = "Wholesaler"
+  ),
+
+  # Volume coverage variables for diagnostics (matching Stata dvol_cov)
+  volume_vars = c(
+    "total",              # Any diagnostic/blood test
+    "rdt",                # Rapid diagnostic test
+    "microscopy"          # Microscopy
+  ),
+  
+  # Product labels for better display
+  volume_labels = list(
+    "total" = "Any malaria blood test",
+    "rdt" = "Rapid diagnostic test (RDT)",
+    "microscopy" = "Microscopy"
+  ),
+  
+  # Output settings
+  file_suffix = "Median sales volume of tests"
+)
+```
+
+```{r load_data, include=FALSE}
+# Load product data (long format) - RDT/diagnostic dataset
+data_file <- here("Data", "Final data", 
+                  paste0(country, "_", year, "_rdt_micro_data.csv"))
+
+if (!file.exists(data_file)) {
+  stop("Data file not found: ", data_file)
+}
+
+product_data <- fread(data_file) %>%
+  # Ensure strata variables are character
+  mutate(across(any_of(c("strata1", "strata2")), as.character)) %>%
+  # Clean up blank but non-missing strata values
+  mutate(
+    strata1 = dplyr::na_if(strata1, ""),
+    strata2 = dplyr::na_if(strata2, "")
+  ) %>%
+  # Drop if outlet category information is missing (following Stata logic)
+  filter(!is.na(outcat2))
+```
+
+```{r data_processing, include=FALSE}
+# Following Stata logic: ensure outlet variables are coded as 0/1
+available_outlet_vars <- intersect(indicator_config$outlet_dummies, names(product_data))
+
+processed_data <- product_data %>%
+  # Recode outlet variables (following Stata: recode `x'(.=0) if total==1)
+  mutate(
+    across(all_of(available_outlet_vars), 
+           ~ifelse(is.na(.) & total == 1, 0, .))
+  ) %>%
+  # Apply population filter
+  filter(!!indicator_config$population_filter)
+
+# Detect strata structure
+strata_info <- list()
+if ("strata1" %in% names(processed_data) && 
+    length(unique(na.omit(processed_data$strata1))) > 1) {
+  strata1_values <- unique(na.omit(processed_data$strata1))
+  strata1_values <- strata1_values[strata1_values != "" & !is.na(trimws(strata1_values))]
+  if (length(strata1_values) > 1) {
+    strata_info$strata1 <- list(variable = "strata1", values = strata1_values)
+  }
+}
+
+if ("strata2" %in% names(processed_data) && 
+    length(unique(na.omit(processed_data$strata2))) > 1) {
+  strata2_values <- unique(na.omit(processed_data$strata2))
+  strata2_values <- strata2_values[strata2_values != "" & !is.na(trimws(strata2_values))]
+  if (length(strata2_values) > 1) {
+    strata_info$strata2 <- list(variable = "strata2", values = strata2_values)
+  }
+}
+
+has_strata1 <- "strata1" %in% names(strata_info)
+has_strata2 <- "strata2" %in% names(strata_info)
+cross_strata_possible <- has_strata1 && has_strata2
+```
+
+```{r survey_setup, include=FALSE}
+# Setup survey design (following Stata: svyset c4 [pweight=wt_allOutlet], strata(strata) fpc(fpc))
+survey_design <- processed_data %>%
+  filter(!is.na(!!sym(indicator_config$survey_weight))) %>%
+  as_survey_design(
+    ids = c4,
+    weights = !!sym(indicator_config$survey_weight),
+    strata = strata1,  # Using strata1 as primary design strata
+    fpc = fpc
+  )
+```
+
+```{r analysis_functions, include=FALSE}
+# Calculate median sales volume using weighted percentiles (standardized output format)
+calculate_volume_medians <- function(survey_data, group_vars = NULL) {
+  
+  results <- tibble()
+  
+  # Available volume variables in the dataset
+  available_volume_vars <- intersect(indicator_config$volume_vars, 
+                                    names(survey_data$variables))
+  
+  # Available outlet variables in the dataset  
+  available_outlet_vars <- intersect(indicator_config$outlet_dummies, 
+                                    names(survey_data$variables))
+  
+  for (volume_var in available_volume_vars) {
+    for (outlet_var in available_outlet_vars) {
+      
+      tryCatch({
+        if (is.null(group_vars)) {
+          # National analysis - following the working sub-analysis pattern
+          outlet_data_raw <- survey_data$variables %>%
+            filter(!!sym(outlet_var) == 1, 
+                   !!sym(volume_var) == 1,
+                   !is.na(volume))
+          
+          if (nrow(outlet_data_raw) > 5) {  # Sufficient observations
+            # Use weighted percentiles directly on the raw data
+            if (requireNamespace("statar", quietly = TRUE)) {
+              percentiles <- statar::pctile(
+                outlet_data_raw$volume, 
+                probs = c(0.25, 0.50, 0.75),
+                wt = outlet_data_raw[[indicator_config$survey_weight]]
+              )
+              
+              result_row <- tibble(
+                antimalarial_type = volume_var,  # Standardized name for common Excel function
+                outlet_type = outlet_var,
+                point_estimate = percentiles[2],  # Median as point estimate
+                lower_ci = percentiles[1],        # Q25 as lower bound
+                upper_ci = percentiles[3],        # Q75 as upper bound
+                sample_size = nrow(outlet_data_raw),
+                antimalarial_label = indicator_config$volume_labels[[volume_var]] %||% volume_var,
+                outlet_label = indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+              )
+              
+              results <- bind_rows(results, result_row)
+            } else {
+              # Fallback to survey package if statar not available
+              subset_design <- subset(survey_data, 
+                                     !!sym(outlet_var) == 1 & 
+                                     !!sym(volume_var) == 1 &
+                                     !is.na(volume))
+              
+              q25 <- svyquantile(~volume, subset_design, quantiles = 0.25, method = "constant")
+              q50 <- svyquantile(~volume, subset_design, quantiles = 0.50, method = "constant") 
+              q75 <- svyquantile(~volume, subset_design, quantiles = 0.75, method = "constant")
+              
+              result_row <- tibble(
+                antimalarial_type = volume_var,  # Standardized name for common Excel function
+                outlet_type = outlet_var,
+                point_estimate = as.numeric(q50),  # Median as point estimate
+                lower_ci = as.numeric(q25),        # Q25 as lower bound
+                upper_ci = as.numeric(q75),        # Q75 as upper bound
+                sample_size = nrow(outlet_data_raw),
+                antimalarial_label = indicator_config$volume_labels[[volume_var]] %||% volume_var,
+                outlet_label = indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+              )
+              
+              results <- bind_rows(results, result_row)
+            }
+          }
+          
+        } else {
+          # Strata analysis
+          strata_values <- unique(survey_data$variables[[group_vars[1]]])
+          strata_values <- strata_values[!is.na(strata_values)]
+          
+          for (strata_val in strata_values) {
+            outlet_data_raw <- survey_data$variables %>%
+              filter(!!sym(group_vars[1]) == strata_val,
+                     !!sym(outlet_var) == 1, 
+                     !!sym(volume_var) == 1,
+                     !is.na(volume))
+            
+            if (nrow(outlet_data_raw) > 5) {
+              if (requireNamespace("statar", quietly = TRUE)) {
+                percentiles <- statar::pctile(
+                  outlet_data_raw$volume, 
+                  probs = c(0.25, 0.50, 0.75),
+                  wt = outlet_data_raw[[indicator_config$survey_weight]]
+                )
+                
+                result_row <- tibble(
+                  antimalarial_type = volume_var,  # Standardized name for common Excel function
+                  outlet_type = outlet_var,
+                  point_estimate = percentiles[2],  # Median as point estimate
+                  lower_ci = percentiles[1],        # Q25 as lower bound
+                  upper_ci = percentiles[3],        # Q75 as upper bound
+                  sample_size = nrow(outlet_data_raw),
+                  antimalarial_label = indicator_config$volume_labels[[volume_var]] %||% volume_var,
+                  outlet_label = indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+                )
+                
+                result_row[[group_vars[1]]] <- as.character(strata_val)
+                results <- bind_rows(results, result_row)
+              } else {
+                # Fallback to survey package
+                subset_design <- subset(survey_data, 
+                                       !!sym(group_vars[1]) == strata_val &
+                                       !!sym(outlet_var) == 1 & 
+                                       !!sym(volume_var) == 1 &
+                                       !is.na(volume))
+                
+                q25 <- svyquantile(~volume, subset_design, quantiles = 0.25, method = "constant")
+                q50 <- svyquantile(~volume, subset_design, quantiles = 0.50, method = "constant")
+                q75 <- svyquantile(~volume, subset_design, quantiles = 0.75, method = "constant")
+                
+                result_row <- tibble(
+                  antimalarial_type = volume_var,  # Standardized name for common Excel function
+                  outlet_type = outlet_var,
+                  point_estimate = as.numeric(q50),  # Median as point estimate
+                  lower_ci = as.numeric(q25),        # Q25 as lower bound
+                  upper_ci = as.numeric(q75),        # Q75 as upper bound
+                  sample_size = nrow(outlet_data_raw),
+                  antimalarial_label = indicator_config$volume_labels[[volume_var]] %||% volume_var,
+                  outlet_label = indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+                )
+                
+                result_row[[group_vars[1]]] <- as.character(strata_val)
+                results <- bind_rows(results, result_row)
+              }
+            }
+          }
+        }
+        
+      }, error = function(e) {
+        message("Error processing ", volume_var, " in ", outlet_var, ": ", e$message)
+      })
+    }
+  }
+  
+  return(results)
+}
+```
+
+```{r footnotes function}
+
+# Calculate footnotes (volume data availability)
+calculate_footnotes <- function(data, strata1_var = NULL, strata2_var = NULL) {
+  
+  # Incomplete interview criteria
+  incomplete_criteria <- c(203,204,205,207,208,303,304,305,307,308,309,310)
+  
+  # Count volume data availability by outlet type
+  outlet_counts <- tibble()
+  available_outlet_vars <- intersect(indicator_config$outlet_dummies, names(data))
+  
+  for (outlet_var in available_outlet_vars) {
+    outlet_label <- indicator_config$outlet_labels[[outlet_var]] %||% outlet_var
+    
+    if (is.null(strata1_var)) {
+      # National counts
+      volume_count <- sum(data[[outlet_var]] == 1 & !is.na(data$volume) & 
+                         data$booster == 0, na.rm = TRUE)
+      incomplete_count <- sum(data$finalintstat %in% incomplete_criteria & 
+                         !is.na(data$volume), na.rm = TRUE)
+      
+      outlet_counts <- bind_rows(outlet_counts, tibble(
+        outlet_type = outlet_var,
+        outlet_label = outlet_label,
+        volume_n = volume_count,
+        incomplete = incomplete_count
+      ))
+    } else {
+      # Strata counts  
+      strata_levels <- unique(data[[strata1_var]])
+      strata_levels <- strata_levels[!is.na(strata_levels)]
+      
+      for (strata_val in strata_levels) {
+        volume_count <- sum(data[[outlet_var]] == 1 & !is.na(data$volume) &
+                           data$booster == 0 & data[[strata1_var]] == strata_val, na.rm = TRUE)
+        incomplete_count <- sum(data$finalintstat %in% incomplete_criteria & 
+                           !is.na(data$volume) & data[[strata1_var]] == strata_val, na.rm = TRUE)
+        
+        outlet_counts <- bind_rows(outlet_counts, tibble(
+          outlet_type = outlet_var,
+          outlet_label = outlet_label,
+          strata = strata_val,
+          volume_n = volume_count,
+          incomplete = incomplete_count
+        ))
+      }
+    }
+  }
+  
+  # Format footnote
+  if (is.null(strata1_var)) {
+    total_volume <- sum(outlet_counts$volume_n, na.rm = TRUE)
+    outlet_text <- paste0(outlet_counts$outlet_label, "=", outlet_counts$volume_n, collapse = "; ")
+    total_incomplete <- sum(outlet_counts$incomplete, na.rm = TRUE)
+    return(paste0("Volume data were available for the following total number of diagnostic products=", 
+                  total_volume, "; by outlet type: ", outlet_text, 
+                  "; The number of diagnostic products with volume data, from outlets that met screening criteria for a full interview but did not complete the interview =", 
+                  total_incomplete))
+  } else {
+    # For strata, return a list of footnotes
+    footnotes <- list()
+    strata_levels <- unique(outlet_counts$strata)
+    
+    for (strata_val in strata_levels) {
+      strata_data <- outlet_counts %>% filter(strata == strata_val)
+      total_volume <- sum(strata_data$volume_n, na.rm = TRUE)
+      outlet_text <- paste0(strata_data$outlet_label, "=", strata_data$volume_n, collapse = "; ")
+      total_incomplete <- sum(strata_data$incomplete, na.rm = TRUE)
+      footnotes[[strata_val]] <- paste0(strata_val, " footnote: Volume data were available for the following total number of diagnostic products=", 
+                                        total_volume, "; by outlet type: ", outlet_text,
+                                        "; The number of diagnostic products with volume data, from outlets that met screening criteria for a full interview but did not complete the interview =", 
+                                        total_incomplete)
+    }
+    return(footnotes)
+  }
+}
+```
+
+```{r run_analysis, include=FALSE}
+# Initialize results storage
+results_list <- list()
+footnotes_list <- list()
+
+# 1. National level results
+national_results <- calculate_volume_medians(survey_design)
+national_footnote <- calculate_footnotes(processed_data)
+
+results_list[["national"]] <- national_results
+footnotes_list[["national"]] <- national_footnote
+
+# 2. Strata1 results (if available)
+if (has_strata1) {
+ strata1_results <- calculate_volume_medians(survey_design, group_vars = "strata1")
+ 
+ if (nrow(strata1_results) > 0) {
+   results_list[["strata1"]] <- strata1_results
+   footnotes_list[["strata1"]] <- calculate_footnotes(
+     processed_data, 
+     strata1_var = strata_info$strata1$variable
+   )
+ }
+}
+
+# 3. Strata2 results (if available) 
+if (has_strata2) {
+ strata2_results <- calculate_volume_medians(survey_design, group_vars = "strata2")
+ 
+ if (nrow(strata2_results) > 0) {
+   results_list[["strata2"]] <- strata2_results
+   footnotes_list[["strata2"]] <- calculate_footnotes(
+     processed_data,
+     strata2_var = strata_info$strata2$variable
+   )
+ }
+}
+
+# 4. Cross-stratification results (if both strata present)
+if (cross_strata_possible) {
+  strata1_values <- unique(survey_design$variables$strata1)
+  strata1_values <- strata1_values[!is.na(strata1_values)]
+  strata2_values <- unique(survey_design$variables$strata2) 
+  strata2_values <- strata2_values[!is.na(strata2_values)]
+  
+  all_cross_results <- tibble()
+  
+  for (strata1_val in strata1_values) {
+    for (strata2_val in strata2_values) {
+      subset_condition <- survey_design$variables$strata1 == strata1_val & 
+                         survey_design$variables$strata2 == strata2_val &
+                         !is.na(survey_design$variables$strata1) &
+                         !is.na(survey_design$variables$strata2)
+      
+      if (sum(subset_condition) > 10) {  # Need more observations for volume analysis
+        subset_design <- subset(survey_design, subset_condition)
+        
+        combo_results <- calculate_volume_medians(subset_design)
+        
+        if (nrow(combo_results) > 0) {
+          combo_results$strata1 <- strata1_val
+          combo_results$strata2 <- strata2_val
+          all_cross_results <- bind_rows(all_cross_results, combo_results)
+        }
+      }
+    }
+  }
+  
+  if (nrow(all_cross_results) > 0) {
+    for (strata1_val in strata1_values) {
+      strata1_data <- all_cross_results %>% filter(strata1 == strata1_val)
+      if (nrow(strata1_data) > 0) {
+        cross_id <- paste0("cross_", strata1_val)
+        results_list[[cross_id]] <- strata1_data
+        
+        processed_strata1 <- processed_data %>% filter(strata1 == strata1_val)
+        footnotes_list[[cross_id]] <- calculate_footnotes(processed_strata1)
+      }
+    }
+  }
+}
+```
+
+```{r create_excel_function}
+# Create Excel output using common function
+source(here("Scripts", "3_Analysis", "create_excel_function.R"))
+
+excel_success <- create_excel_output(
+  results_list = results_list,
+  footnotes_list = footnotes_list, 
+  indicator_config = indicator_config,
+  country = country,
+  year = year,
+  include_antimalarial_col = TRUE
+)
+
+if (!excel_success) {
+  message("Unable to create Excel file")
+} 
+```
+
+```{r analysis_summary, results='asis'}
+cat("## Analysis Summary\n\n")
+cat("**Data Processing:**\n\n")
+cat("- Original products in dataset:", nrow(product_data), "\n")
+cat("- Products with volume data included:", nrow(processed_data), "\n")
+cat("- Survey design: Complex sampling with outlet weights\n")
+cat("- Population: Products with volume data (booster==0)\n\n")
+
+cat("**Stratification:**\n\n")
+if (length(strata_info) > 0) {
+  for (stratum_name in names(strata_info)) {
+    stratum <- strata_info[[stratum_name]]
+    cat("-", stratum_name, "(", length(stratum$values), "levels):", 
+        paste(stratum$values, collapse = ", "), "\n")
+  }
+  if (cross_strata_possible) {
+    cat("- Cross-stratification: Available\n")
+  }
+  cat("\n")
+} else {
+  cat("- No stratification variables available\n\n")
+}
+
+available_volume_vars <- intersect(indicator_config$volume_vars, names(processed_data))
+available_outlet_vars <- intersect(indicator_config$outlet_dummies, names(processed_data))
+
+cat("**Available Products:**", length(available_volume_vars), "diagnostic categories\n\n")
+cat("**Available Outlet Types:**", length(available_outlet_vars), "outlet types\n\n")
+```
+
+## Results
+
+```{r figure_size_presets}
+overall_base_size = 18
+point_estimate_size = 4
+```
+
+#### Figure 1. Diagnostic Sales Volume Distribution by Diagnostic Type (National)
+
+```{r figure_diagnostic_volume_national, fig.width=10, fig.height=6}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Get available diagnostic types from actual data
+  available_diagnostic_types <- intersect(indicator_config$volume_vars, unique(results_list[["national"]]$antimalarial_type))
+  
+  # Focus on diagnostic types and aggregate across outlets
+  diagnostic_volume_data <- results_list[["national"]] %>%
+    filter(antimalarial_type %in% available_diagnostic_types) %>%
+    group_by(antimalarial_type, antimalarial_label) %>%
+    summarise(
+      median = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      q25 = weighted.mean(lower_ci, sample_size, na.rm = TRUE), 
+      q75 = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      total_sample = sum(sample_size, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(median))
+  
+  if (nrow(diagnostic_volume_data) > 0) {
+    ggplot(diagnostic_volume_data, aes(x = fct_reorder(antimalarial_label, median), 
+                               y = median)) +
+      geom_col(fill = "steelblue", alpha = 0.8) +
+      geom_errorbar(aes(ymin = q25, ymax = q75), 
+                    width = 0.2, color = "black") +
+      coord_flip() +
+      labs(
+        title = str_wrap("Median Sales Volume of Diagnostics by Type - National", width = 60),
+        x = "Diagnostic Type",
+        y = "Median Sales Volume (Tests)",
+        caption = "Error bars show 25th and 75th percentiles (IQR)"
+      ) +
+      theme_minimal(base_size = overall_base_size) +
+      theme(
+        plot.title = element_text(face = "bold")
+      ) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+  } else {
+    cat("No diagnostic volume data available")
+  }
+} else {
+  cat("No national data available")
+}
+```
+
+#### Figure 2. Diagnostic Sales Volume by Diagnostic Type and Strata1
+
+```{r figure_diagnostic_volume_strata1, fig.width=12, fig.height=8}
+if ("strata1" %in% names(results_list) && nrow(results_list[["strata1"]]) > 0) {
+  
+  available_diagnostic_types <- intersect(indicator_config$volume_vars, unique(results_list[["strata1"]]$antimalarial_type))
+  
+  strata1_diagnostic_volume <- results_list[["strata1"]] %>%
+    filter(antimalarial_type %in% available_diagnostic_types) %>%
+    group_by(antimalarial_type, antimalarial_label, strata1) %>%
+    summarise(
+      median = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      q25 = weighted.mean(lower_ci, sample_size, na.rm = TRUE),
+      q75 = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(strata1_diagnostic_volume) > 0) {
+    ggplot(strata1_diagnostic_volume, aes(x = fct_reorder(antimalarial_label, median),
+                                  y = median, fill = strata1)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = q25, ymax = q75), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      coord_flip() +
+      labs(
+        title = str_wrap("Median Diagnostic Sales Volume by Type and Strata1", width = 60),
+        x = "Diagnostic Type",
+        y = "Median Sales Volume (Tests)",
+        fill = "Strata1",
+        caption = "Error bars show 25th and 75th percentiles (IQR)"
+      ) +
+    theme_minimal(base_size = overall_base_size) +
+    theme(
+      plot.title = element_text(size = rel(1.1), face = "bold"),
+      axis.text = element_text(size = rel(0.9)),
+      axis.title = element_text(size = rel(1.0)),
+      legend.position = "bottom") +
+    scale_fill_brewer(type = "qual", palette = "Set1") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+#### Figure 3. Any Diagnostic Sales Volume by Outlet Type and Strata1
+
+```{r figure_anydiagnostic_outlet_strata1, fig.width=12, fig.height=8}
+if ("strata1" %in% names(results_list) && nrow(results_list[["strata1"]]) > 0) {
+  
+  strata1_anydiagnostic <- results_list[["strata1"]] %>%
+    filter(antimalarial_type == "total")
+  
+  if (nrow(strata1_anydiagnostic) > 0) {
+    ggplot(strata1_anydiagnostic, aes(x = fct_reorder(outlet_label, point_estimate), 
+                              y = point_estimate, fill = strata1)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      coord_flip() +
+      labs(
+        title = str_wrap("Median Any Diagnostic Sales Volume by Outlet Type and Strata1", width = 60),
+        x = "Outlet Type",
+        y = "Median Sales Volume (Tests)",
+        fill = "Strata1",
+        caption = "Error bars show 25th and 75th percentiles (IQR)"
+      ) +
+    theme_minimal(base_size = overall_base_size) +
+    theme(
+      plot.title = element_text(size = rel(1.1), face = "bold"),
+      axis.text = element_text(size = rel(0.9)),
+      axis.title = element_text(size = rel(1.0)),
+      legend.position = "bottom") +
+    scale_fill_brewer(type = "qual", palette = "Set1") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+`r if(has_strata2) "#### Figure 4. Diagnostic Sales Volume by Type and Strata2"`
+
+```{r figure_diagnostic_volume_strata2, fig.width=12, fig.height=8}
+if ("strata2" %in% names(results_list) && nrow(results_list[["strata2"]]) > 0) {
+  
+  available_diagnostic_types <- intersect(indicator_config$volume_vars, unique(results_list[["strata2"]]$antimalarial_type))
+  
+  strata2_diagnostic_volume <- results_list[["strata2"]] %>%
+    filter(antimalarial_type %in% available_diagnostic_types) %>%
+    group_by(antimalarial_type, antimalarial_label, strata2) %>%
+    summarise(
+      median = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      q25 = weighted.mean(lower_ci, sample_size, na.rm = TRUE),
+      q75 = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(strata2_diagnostic_volume) > 0) {
+    ggplot(strata2_diagnostic_volume, aes(x = fct_reorder(antimalarial_label, median), 
+                                  y = median, fill = strata2)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = q25, ymax = q75), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      coord_flip() +
+      labs(
+        title = str_wrap("Median Diagnostic Sales Volume by Type and Strata2", width = 60),
+        x = "Diagnostic Type",
+        y = "Median Sales Volume (Tests)",
+        fill = "Strata2",
+        caption = "Error bars show 25th and 75th percentiles (IQR)"
+      ) +
+    theme_minimal(base_size = overall_base_size) +
+    theme(
+      plot.title = element_text(size = rel(1.1), face = "bold"),
+      axis.text = element_text(size = rel(0.9)),
+      axis.title = element_text(size = rel(1.0)),
+      legend.position = "bottom") +
+    scale_fill_brewer(type = "qual", palette = "Set2") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+`r if(has_strata2) "#### Figure 5. Any Diagnostic Sales Volume by Outlet Type and Strata2"`
+
+```{r figure_anydiagnostic_outlet_strata2, fig.width=12, fig.height=8}
+if ("strata2" %in% names(results_list) && nrow(results_list[["strata2"]]) > 0) {
+  
+  strata2_anydiagnostic <- results_list[["strata2"]] %>%
+    filter(antimalarial_type == "total")
+  
+  if (nrow(strata2_anydiagnostic) > 0) {
+    ggplot(strata2_anydiagnostic, aes(x = fct_reorder(outlet_label, point_estimate), 
+                              y = point_estimate, fill = strata2)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      coord_flip() +
+      labs(
+        title = str_wrap("Median Any Diagnostic Sales Volume by Outlet Type and Strata2", width = 60),
+        x = "Outlet Type", 
+        y = "Median Sales Volume (Tests)",
+        fill = "Strata2",
+        caption = "Error bars show 25th and 75th percentiles (IQR)"
+      ) +
+    theme_minimal(base_size = overall_base_size) +
+    theme(
+      plot.title = element_text(size = rel(1.1), face = "bold"),
+      axis.text = element_text(size = rel(0.9)),
+      axis.title = element_text(size = rel(1.0)),
+      legend.position = "bottom") +
+      scale_fill_brewer(type = "qual", palette = "Set2") +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+`r if(cross_strata_possible) "#### Figure 6. Any Diagnostic Sales Volume by Outlet Type - Cross-Stratification"`
+```{r figure_anydiagnostic_cross_strata, fig.width=14, fig.height=10}
+if (cross_strata_possible) {
+  cross_results <- names(results_list)[grepl("^cross_", names(results_list))]
+  
+  if (length(cross_results) > 0) {
+    # Combine all cross-stratification results for plotting
+    all_cross_data <- tibble()
+    
+    for (cross_name in cross_results) {
+      cross_data <- results_list[[cross_name]] %>%
+        filter(antimalarial_type == "total") %>%
+        mutate(strata1_group = gsub("cross_", "", cross_name))
+      all_cross_data <- bind_rows(all_cross_data, cross_data)
+    }
+    
+    if (nrow(all_cross_data) > 0) {
+      ggplot(all_cross_data, aes(x = fct_reorder(outlet_label, point_estimate), 
+                                y = point_estimate, fill = strata2)) +
+        geom_col(position = "dodge", alpha = 0.8) +
+        geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                      position = position_dodge(width = 0.9), width = 0.2) +
+        facet_wrap(~strata1_group, scales = "fixed") +
+        coord_flip() +
+        labs(
+          title = str_wrap("Median Any Diagnostic Sales Volume by Outlet Type - Cross-Stratification", width = 60),
+          x = "Outlet Type", 
+          y = "Median Sales Volume (Tests)",
+          fill = "Strata2",
+          caption = "Error bars show 25th and 75th percentiles (IQR)"
+        ) +
+        theme_minimal(base_size = 14) +
+        theme(
+          plot.title = element_text(face = "bold"),
+          legend.position = "bottom",
+          strip.text = element_text(face = "bold")
+        ) +
+        scale_fill_brewer(type = "qual", palette = "Set1") +
+        scale_y_continuous(expand = expansion(mult = c(0, 0.15)),
+                          labels = scales::comma)
+    }
+  }
+}
+```
+\newpage
+
+## Tables
+
+### Table 1: National Level Results - Volume by Diagnostic × Outlet Matrix
+
+```{r table_national_volume, results='asis'}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Create comprehensive table with volumes (median) as values
+  volume_matrix <- results_list[["national"]] %>%
+    select(antimalarial_label, outlet_label, point_estimate) %>%
+    pivot_wider(names_from = outlet_label, values_from = point_estimate, values_fill = 0) %>%
+    mutate(across(where(is.numeric), ~round(., 1)))
+  
+  table_output <- knitr::kable(volume_matrix, format = "markdown", 
+                              caption = "Median Sales Volume (tests per month)")
+  cat(table_output, sep = "\n")
+  cat("\n*", footnotes_list[["national"]], "*\n\n")
+  
+} else {
+  cat("**No national level data available**\n\n")
+}
+```
+
+## Technical Notes
+
+**Survey Design:** Complex sampling with outlet weights (`wt_alloutlet`), cluster sampling (c4), stratification (strata1), and finite population correction (fpc).
+
+**Population Filter:** Analysis limited to diagnostic products with volume data available (`!is.na(volume)`) and excluding booster samples (`booster == 0`).
+
+**Statistical Method:** Survey-weighted quantiles (25th, 50th, and 75th percentiles) using `statar::pctile()` for weighted percentiles, with fallback to `survey` package's `svyquantile()`.
+
+**Volume Measurement:** Sales volume measured as number of blood tests sold per outlet per specified time period.
+
+**Results Structure:**  
+- **National:** Overall volume medians across all outlets with volume data  
+- **Strata1:** Volume medians by primary stratification variable (if present and varies)  
+- **Strata2:** Volume medians by secondary stratification variable (if present and varies)  
+- **Cross-stratification:** Volume medians by strata2 within each level of strata1 (if both strata present)  
+
+**Excel Output:** Results exported to Excel workbook in `Results/Indicator 3.3/` directory using the shared `create_excel_output()` function. The workbook includes:  
+- **National sheet:** Wide format with outlets as columns (Point/Lower/Upper estimates)  
+- **Strata1 sheets:** Results by primary stratification (if available)  
+- **Strata2 sheet:** Results by secondary stratification (if available)  
+- **Cross-stratification sheets:** Results by strata1 × strata2 combinations (if available)  
+- **Long Format sheet:** Complete detailed results with all metrics  
+
+**Footnotes:** Include counts of diagnostic products with volume data by outlet type and counts of products from outlets that met screening criteria but did not complete interviews.
+
+**Table Structure:**
+- **Table 1:** National volume matrix (diagnostic × outlet, median values only) in Word document
+
+**Data Standardization:** Results use common column structure where:  
+- `point_estimate` = median sales volume (tests per month)  
+- `lower_ci` = 25th percentile (Q25)  
+- `upper_ci` = 75th percentile (Q75)  
+- Column names use `antimalarial_type` and `antimalarial_label` for consistency with shared Excel functions, but contain diagnostic product types
+
+**Stata Translation Notes:** This analysis replicates the Stata code in `3_3_Median_sales_volume_of_malaria_blood_tests.do`, using:  
+- R variable names (e.g., `private_nonprofit`, `total_informal`) instead of Stata abbreviations (e.g., `pnp`, `inf`)  
+- The same survey design specifications and percentile calculations (`_pctile volume [pw=wt_allOutlet]`)  
+- Matching footnote structure and Excel output format  
+- Same analysis structure as Indicator 3.1 (antimalarials), adapted for diagnostic products  
+
+---
+
+**Report generated:** `r format(Sys.time(), '%B %d, %Y at %I:%M %p')`

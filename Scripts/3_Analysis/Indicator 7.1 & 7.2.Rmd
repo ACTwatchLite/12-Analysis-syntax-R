@@ -1,0 +1,781 @@
+---
+title: "ACTwatch Indicator 7.1.2 - Stockouts of Antimalarials and RDTs"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output: 
+  word_document:
+    toc: false
+    toc_depth: 2
+    reference_docx: null
+---
+
+## Indicator Definition
+
+**Indicator Group:** Stockouts - Product stockouts reported by outlets
+
+**Description:** The percentage of screened outlets reporting stockouts of antimalarials and RDTs, by product type and outlet type
+
+**Numerator:** Number of screened outlets reporting stockout of a specific product type
+
+**Denominator:** All screened outlets with stockout data available
+
+**Disaggregation:** By product stockout type and outlet type; additional disaggregation by strata if available
+
+**Data Source:** Outlet data (not product data)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, 
+                      fig.width = 12, fig.height = 8)
+
+# Set survey option to handle single PSU strata
+options(survey.lonely.psu = "adjust")
+
+library(tidyverse)
+library(survey)
+library(srvyr)
+library(openxlsx)
+library(forcats)
+library(here)
+library(data.table)
+
+# Set parameters
+if (!exists("country")) stop("Global variable 'country' not found")
+if (!exists("year")) stop("Global variable 'year' not found") 
+
+# Load outlet data to detect available stockout variables
+data_file <- here("Data", "Final data", 
+                  paste0(country, "_", year, "_outlet_data.csv"))
+
+if (!file.exists(data_file)) {
+  stop("Data file not found: ", data_file)
+}
+
+outlet_data_temp <- fread(data_file) %>%
+  rename_with(tolower)
+
+# Dynamically detect stockout variables
+# Start with base variable list
+stockout_vars <- c()
+stockout_labels <- list()
+
+# Create so_any if it doesn't exist (from a16==1)
+if ("a16" %in% names(outlet_data_temp)) {
+  stockout_vars <- c("so_any")
+  stockout_labels[["so_any"]] <- "Outlet reports any stockout"
+}
+
+# Detect all so_* variables in the data
+so_vars <- names(outlet_data_temp)[grepl("^so_", names(outlet_data_temp))]
+
+# Add detected variables with labels
+for (var in so_vars) {
+  if (!var %in% stockout_vars) {  # Don't duplicate so_any if it exists
+    stockout_vars <- c(stockout_vars, var)
+    
+    # Create label based on variable name
+    label <- case_when(
+      var == "so_act" ~ "ACT stockout",
+      var == "so_al" ~ "Artemether-lumefantrine stockout",
+      var == "so_asaq" ~ "Artesunate-amodiaquine stockout",
+      var == "so_dhappq" ~ "Dihydroartemisinin-piperaquine stockout",
+      var == "so_appq" ~ "Artemisinin-piperaquine stockout",
+      var == "so_ar" ~ "Injectable artemether stockout",
+      var == "so_as" ~ "Injectable artesunate stockout",
+      var == "so_cq" ~ "Chloroquine stockout",
+      var == "so_qn" ~ "Quinine stockout",
+      var == "so_sp" ~ "Sulfadoxine-pyrimethamine stockout",
+      var == "so_rdt" ~ "RDT stockout",
+      TRUE ~ paste0(toupper(gsub("so_", "", var)), " stockout")
+    )
+    
+    stockout_labels[[var]] <- label
+  }
+}
+
+cat("Found", length(stockout_vars), "stockout variables:\n")
+for (i in seq_along(stockout_vars)) {
+  cat(sprintf("%d. %s: %s\n", i, stockout_vars[i], stockout_labels[[stockout_vars[i]]]))
+}
+
+# Clean up temporary data
+rm(outlet_data_temp)
+
+# Configuration
+indicator_config <- list(
+  indicator_id = "7.1.2",
+  title = "Stockouts of Antimalarials and RDTs", 
+  description = "Percentage of screened outlets reporting stockouts by product type and outlet type",
+  
+  # Analysis settings
+  dataset = "outlet", # Outlet-level data
+  analysis_type = "proportion",
+  survey_weight = "wt_alloutlet", # Standard outlet weight
+  population_filter = quote(screened == 1 & !is.na(a16)), # Screened outlets with stockout data
+  
+
+    # Outlet types (matching Stata outvars4 - needs customization)
+  outlet_dummies = c("private_nonprofit", "private_forprofit", "pharmacy",
+                    "laboratory", "drug_store", "wholesale", "total_informal", "total_retail"),
+  outlet_labels = list(
+    "private_nonprofit" = "Private Not-for-Profit",
+    "private_forprofit" = "Private For-Profit", 
+    "pharmacy" = "Pharmacy",
+    "laboratory" = "Laboratory", 
+    "drug_store" = "Drug Store",
+    "wholesale" = "Wholesale",
+    "total_informal" = "Informal (Total)",
+    "total_retail" = "Retail (Total)"
+  ),
+
+  # Stockout variables - dynamically detected above
+  stockout_vars = stockout_vars,
+  stockout_labels = stockout_labels,
+  stockout_order = stockout_vars,
+  
+  # Output settings
+  file_suffix = "Stockouts of antimalarials and RDTs"
+)
+
+# Source the create_excel_function (if available)
+excel_function_path <- here("Scripts", "3_Analysis", "create_excel_function.R")
+if (file.exists(excel_function_path)) {
+  source(excel_function_path)
+}
+```
+
+```{r load_data, include=FALSE}
+# Load outlet data
+outlet_data <- fread(data_file) %>%
+  # Convert all variable names to lowercase for consistency
+  rename_with(tolower) %>%
+  # Ensure strata variables are character
+  mutate(across(any_of(c("strata1", "strata2")), as.character)) %>%
+  # Clean up blank but non-missing strata values
+  mutate(
+    strata1 = dplyr::na_if(strata1, ""),
+    strata2 = dplyr::na_if(strata2, "")
+  )
+```
+
+```{r data_processing, include=FALSE}
+# Create so_any if it doesn't already exist (from a16==1)
+if (!"so_any" %in% names(outlet_data) && "a16" %in% names(outlet_data)) {
+  outlet_data <- outlet_data %>%
+    mutate(so_any = if_else(a16 == 1, 1, NA_real_))
+}
+
+# Apply population filter (screened outlets with stockout data)
+base_data <- outlet_data %>%
+  filter(!!indicator_config$population_filter)
+
+# Check which outlet variables are available
+available_outlet_vars <- intersect(indicator_config$outlet_dummies, names(base_data))
+
+# Check which stockout variables are available
+available_stockout_vars <- intersect(indicator_config$stockout_vars, names(base_data))
+
+if (length(available_stockout_vars) == 0) {
+  stop("No stockout variables found in data. Expected variables: ", 
+       paste(indicator_config$stockout_vars, collapse = ", "))
+}
+
+cat("\nAnalyzing", length(available_stockout_vars), "stockout variables across", 
+    length(available_outlet_vars), "outlet types\n")
+
+# Detect strata structure
+strata_info <- list()
+if ("strata1" %in% names(base_data) && 
+    length(unique(na.omit(base_data$strata1))) > 1) {
+  strata1_values <- unique(na.omit(base_data$strata1))
+  strata1_values <- strata1_values[strata1_values != "" & !is.na(trimws(strata1_values))]
+  if (length(strata1_values) > 1) {
+    strata_info$strata1 <- list(variable = "strata1", values = strata1_values)
+  }
+}
+
+if ("strata2" %in% names(base_data) && 
+    length(unique(na.omit(base_data$strata2))) > 1) {
+  strata2_values <- unique(na.omit(base_data$strata2))
+  strata2_values <- strata2_values[strata2_values != "" & !is.na(trimws(strata2_values))]
+  if (length(strata2_values) > 1) {
+    strata_info$strata2 <- list(variable = "strata2", values = strata2_values)
+  }
+}
+
+has_strata1 <- "strata1" %in% names(strata_info)
+has_strata2 <- "strata2" %in% names(strata_info)
+cross_strata_possible <- has_strata1 && has_strata2
+```
+
+```{r analysis_function, include=FALSE}
+# Function to calculate stockout proportions for a specific stockout type and outlet combination
+analyze_stockouts <- function(data, stockout_var, outlet_vars, survey_weight, 
+                              strata_var = NULL, strata_values = NULL) {
+  
+  # Check if variables exist
+  if (!stockout_var %in% names(data)) {
+    warning(paste("Stockout variable", stockout_var, "not found"))
+    return(NULL)
+  }
+  
+  # Apply strata filter if specified
+  if (!is.null(strata_var) && !is.null(strata_values)) {
+    if (length(strata_values) == 1) {
+      data <- data %>%
+        filter(!!sym(strata_var) == strata_values)
+    }
+  }
+  
+  if (nrow(data) == 0) {
+    return(NULL)
+  }
+  
+  # Setup survey design
+  data_filtered <- data %>%
+    filter(!is.na(!!sym(survey_weight)))
+  
+  # Check if we have enough PSUs for survey design
+  n_psu <- data_filtered %>% 
+    summarise(n_psu = n_distinct(c4, na.rm = TRUE)) %>% 
+    pull(n_psu)
+  
+  if (n_psu < 2) {
+    message(paste("Skipping", stockout_var, "- insufficient PSUs (n =", n_psu, ")"))
+    return(NULL)
+  }
+  
+  survey_design <- tryCatch({
+    data_filtered %>%
+      as_survey_design(
+        ids = c4,
+        weights = !!sym(survey_weight),
+        strata = strata1,
+        fpc = fpc
+      )
+  }, error = function(e) {
+    message(paste("Error creating survey design for", stockout_var, ":", e$message))
+    return(NULL)
+  })
+  
+  if (is.null(survey_design)) {
+    return(NULL)
+  }
+  
+  results <- tibble()
+  
+  # Calculate proportions for each outlet type
+  for (outlet in outlet_vars) {
+    if (!outlet %in% names(data)) next
+    
+    outlet_data <- survey_design %>%
+      filter(!!sym(outlet) == 1)
+    
+    if (nrow(outlet_data) == 0) next
+    
+    # Check if any outlets have this stockout
+    n_with_stockout <- outlet_data %>%
+      filter(!!sym(stockout_var) == 1) %>%
+      nrow()
+    
+    if (n_with_stockout == 0) {
+      # No stockouts - record as 0% with N
+      result_row <- tibble(
+        stockout_type = stockout_var,
+        antimalarial_label = indicator_config$stockout_labels[[stockout_var]] %||% stockout_var,
+        outlet_type = outlet,
+        outlet_label = indicator_config$outlet_labels[[outlet]] %||% outlet,
+        point_estimate = 0,
+        lower_ci = NA_real_,
+        upper_ci = NA_real_,
+        sample_size = nrow(outlet_data)
+      )
+    } else {
+      # Calculate proportion with 95% CI
+      tryCatch({
+        prop_result <- outlet_data %>%
+          summarise(
+            prop = survey_mean(!!sym(stockout_var) == 1, vartype = "ci", na.rm = TRUE),
+            n = n()
+          )
+        
+        result_row <- tibble(
+          stockout_type = stockout_var,
+          antimalarial_label = indicator_config$stockout_labels[[stockout_var]] %||% stockout_var,
+          outlet_type = outlet,
+          outlet_label = indicator_config$outlet_labels[[outlet]] %||% outlet,
+          point_estimate = prop_result$prop * 100,  # Convert to percentage
+          lower_ci = prop_result$prop_low * 100,
+          upper_ci = prop_result$prop_upp * 100,
+          sample_size = prop_result$n
+        )
+      }, error = function(e) {
+        message(paste("Error calculating proportion for", outlet, ":", e$message))
+        return(NULL)
+      })
+    }
+    
+    if (!is.null(strata_var)) {
+      if (length(strata_values) == 1) {
+        result_row[[strata_var]] <- strata_values
+      }
+    }
+    
+    results <- bind_rows(results, result_row)
+  }
+  
+  return(results)
+}
+
+# Function to calculate footnotes
+calculate_footnotes <- function(data, outlet_vars) {
+  footnotes <- list()
+  
+  # Count screened outlets with stockout data for each outlet type
+  outlet_counts <- sapply(outlet_vars, function(outlet) {
+    if (outlet %in% names(data)) {
+      data %>%
+        filter(!!sym(outlet) == 1) %>%
+        nrow()
+    } else {
+      0
+    }
+  })
+  
+  # Count outlets that met screening but didn't complete interview
+  incomplete_interviews <- data %>%
+    filter(finalintstat %in% c(203, 204, 205, 207, 208, 303, 304, 305, 307, 308, 309, 310)) %>%
+    nrow()
+  
+  # Build footnote string
+  outlet_footnote_parts <- sapply(names(outlet_counts), function(outlet) {
+    label <- indicator_config$outlet_labels[[outlet]] %||% outlet
+    paste0(label, "=", outlet_counts[[outlet]])
+  })
+  
+  footnote_text <- paste0(
+    "N screened outlets with stockout data: ",
+    paste(outlet_footnote_parts, collapse = "; "),
+    ". Outlets that met screening criteria for a full interview but did not complete the interview and have stockout data = ",
+    incomplete_interviews
+  )
+  
+  return(footnote_text)
+}
+```
+
+```{r run_analysis, include=FALSE}
+# Initialize results storage
+results_list <- list()
+footnotes_list <- list()
+
+# Calculate overall footnote
+overall_footnote <- calculate_footnotes(base_data, available_outlet_vars)
+
+# Analyze each stockout type
+for (stockout_var in available_stockout_vars) {
+  
+  # National level
+  national_results <- analyze_stockouts(
+    base_data, stockout_var, available_outlet_vars, indicator_config$survey_weight
+  )
+  
+  if (!is.null(national_results) && nrow(national_results) > 0) {
+    if (!"national" %in% names(results_list)) {
+      results_list[["national"]] <- tibble()
+    }
+    results_list[["national"]] <- bind_rows(results_list[["national"]], national_results)
+  }
+  
+  # Strata1 level
+  if (has_strata1) {
+    for (strata_val in strata_info$strata1$values) {
+      strata1_results <- analyze_stockouts(
+        base_data, stockout_var, available_outlet_vars, indicator_config$survey_weight,
+        strata_var = "strata1", strata_values = strata_val
+      )
+      
+      if (!is.null(strata1_results) && nrow(strata1_results) > 0) {
+        if (!"strata1" %in% names(results_list)) {
+          results_list[["strata1"]] <- tibble()
+        }
+        results_list[["strata1"]] <- bind_rows(results_list[["strata1"]], strata1_results)
+      }
+    }
+  }
+  
+  # Strata2 level
+  if (has_strata2) {
+    for (strata_val in strata_info$strata2$values) {
+      strata2_results <- analyze_stockouts(
+        base_data, stockout_var, available_outlet_vars, indicator_config$survey_weight,
+        strata_var = "strata2", strata_values = strata_val
+      )
+      
+      if (!is.null(strata2_results) && nrow(strata2_results) > 0) {
+        if (!"strata2" %in% names(results_list)) {
+          results_list[["strata2"]] <- tibble()
+        }
+        results_list[["strata2"]] <- bind_rows(results_list[["strata2"]], strata2_results)
+      }
+    }
+  }
+  
+  # Cross-stratification
+  if (cross_strata_possible) {
+    for (s1_val in strata_info$strata1$values) {
+      for (s2_val in strata_info$strata2$values) {
+        cross_data <- base_data %>%
+          filter(strata1 == s1_val & strata2 == s2_val)
+        
+        if (nrow(cross_data) > 0) {
+          cross_results <- analyze_stockouts(
+            cross_data, stockout_var, available_outlet_vars, indicator_config$survey_weight
+          )
+          
+          if (!is.null(cross_results) && nrow(cross_results) > 0) {
+            cross_results <- cross_results %>%
+              mutate(strata1 = s1_val, strata2 = s2_val)
+            
+            cross_name <- paste0("cross_", s1_val)
+            if (!cross_name %in% names(results_list)) {
+              results_list[[cross_name]] <- tibble()
+            }
+            results_list[[cross_name]] <- bind_rows(results_list[[cross_name]], cross_results)
+          }
+        }
+      }
+    }
+  }
+}
+
+# Set footnotes for all sheets
+for (sheet_name in names(results_list)) {
+  footnotes_list[[sheet_name]] <- overall_footnote
+}
+```
+
+```{r export_excel, include=FALSE}
+# Use the standard create_excel_output function
+excel_success <- create_excel_output(
+  results_list = results_list,
+  footnotes_list = footnotes_list, 
+  indicator_config = indicator_config,
+  country = country,
+  year = year,
+  include_antimalarial_col = TRUE
+)
+
+if (excel_success) {
+  cat("Excel file created successfully\n")
+} else {
+  cat("Warning: Excel file creation encountered issues\n")
+}
+```
+
+\newpage
+
+## Executive Summary
+
+This indicator analyzes the percentage of screened outlets reporting stockouts of antimalarials and RDTs. Stockouts represent a critical supply chain challenge that affects access to essential malaria treatments and diagnostics.
+
+Results are disaggregated by outlet type and, where applicable, by geographic or administrative strata.
+
+**Key Findings:**
+
+```{r summary_stats, results='asis'}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Summarize by stockout type
+  summary_by_stockout <- results_list[["national"]] %>%
+    group_by(antimalarial_label) %>%
+    summarise(
+      mean_pct = mean(point_estimate, na.rm = TRUE),
+      min_pct = min(point_estimate, na.rm = TRUE),
+      max_pct = max(point_estimate, na.rm = TRUE),
+      outlets_reporting = sum(sample_size, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(mean_pct))
+  
+  cat("\n**Stockout Prevalence Summary:**\n\n")
+  for (i in 1:nrow(summary_by_stockout)) {
+    cat(paste0("- **", summary_by_stockout$antimalarial_label[i], ":** ", 
+               round(summary_by_stockout$mean_pct[i], 1), "% of outlets",
+               " (range: ", round(summary_by_stockout$min_pct[i], 1), 
+               "% to ", round(summary_by_stockout$max_pct[i], 1), "%)\n"))
+  }
+  
+} else {
+  cat("**No national level data available**\n\n")
+}
+```
+
+\newpage
+
+## Figures
+
+### Figure 1: Stockout Prevalence by Product Type (National Level)
+
+```{r figure_national_stockouts, fig.width=12, fig.height=8}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Calculate mean across outlets for each stockout type
+  national_stockout_pct <- results_list[["national"]] %>%
+    group_by(antimalarial_label) %>%
+    summarise(
+      mean_pct = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(national_stockout_pct) > 0) {
+    ggplot(national_stockout_pct, aes(x = reorder(antimalarial_label, mean_pct), 
+                                       y = mean_pct)) +
+      geom_col(fill = "#d73027", alpha = 0.8) +
+      coord_flip() +
+      labs(
+        title = "Stockout Prevalence by Product Type (National Level)",
+        x = "Product Type",
+        y = "Percentage of Outlets Reporting Stockout (%)",
+        caption = "Weighted mean across outlet types"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        axis.text = element_text(size = 12)
+      ) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.15)),
+                        limits = c(0, NA))
+  }
+}
+```
+
+### Figure 2: Stockout Prevalence by Outlet Type (National Level)
+
+```{r figure_outlet_stockouts, fig.width=12, fig.height=10}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  ggplot(results_list[["national"]], 
+         aes(x = fct_reorder(outlet_label, point_estimate), 
+             y = point_estimate, fill = antimalarial_label)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                  position = position_dodge(width = 0.9), width = 0.2) +
+    coord_flip() +
+    labs(
+      title = "Stockout Prevalence by Outlet Type and Product Type",
+      x = "Outlet Type",
+      y = "Percentage Reporting Stockout (%)",
+      fill = "Product Type",
+      caption = "Error bars show 95% confidence intervals"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom",
+      legend.text = element_text(size = 9)
+    ) +
+    scale_fill_brewer(type = "qual", palette = "Set1") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15)),
+                      limits = c(0, NA)) +
+    guides(fill = guide_legend(ncol = 2))
+}
+```
+
+`r if(has_strata1) "### Figure 3: Stockout Prevalence by Product Type and Strata1"`
+
+```{r figure_stockout_strata1, fig.width=12, fig.height=8}
+if ("strata1" %in% names(results_list) && nrow(results_list[["strata1"]]) > 0) {
+  
+  strata1_stockout_pct <- results_list[["strata1"]] %>%
+    group_by(antimalarial_label, strata1) %>%
+    summarise(
+      mean_pct = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(strata1_stockout_pct) > 0) {
+    ggplot(strata1_stockout_pct, aes(x = reorder(antimalarial_label, mean_pct), 
+                                      y = mean_pct, fill = strata1)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      coord_flip() +
+      labs(
+        title = "Stockout Prevalence by Product Type and Strata1",
+        x = "Product Type",
+        y = "Percentage Reporting Stockout (%)",
+        fill = "Strata1"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+      ) +
+      scale_fill_brewer(type = "qual", palette = "Set2") +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.15)),
+                        limits = c(0, NA))
+  }
+}
+```
+
+`r if(has_strata2) "### Figure 4: Stockout Prevalence by Product Type and Strata2"`
+
+```{r figure_stockout_strata2, fig.width=12, fig.height=8}
+if ("strata2" %in% names(results_list) && nrow(results_list[["strata2"]]) > 0) {
+  
+  strata2_stockout_pct <- results_list[["strata2"]] %>%
+    group_by(antimalarial_label, strata2) %>%
+    summarise(
+      mean_pct = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(strata2_stockout_pct) > 0) {
+    ggplot(strata2_stockout_pct, aes(x = reorder(antimalarial_label, mean_pct), 
+                                      y = mean_pct, fill = strata2)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      coord_flip() +
+      labs(
+        title = "Stockout Prevalence by Product Type and Strata2",
+        x = "Product Type",
+        y = "Percentage Reporting Stockout (%)",
+        fill = "Strata2"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+      ) +
+      scale_fill_brewer(type = "qual", palette = "Set3") +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.15)),
+                        limits = c(0, NA))
+  }
+}
+```
+
+\newpage
+
+## Tables
+
+### Table 1: National Level Results - Stockout Prevalence by Product Type × Outlet Matrix
+
+```{r table_national_stockouts, results='asis'}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Create comprehensive table with percentages as values
+  stockout_matrix <- results_list[["national"]] %>%
+    select(antimalarial_label, outlet_label, point_estimate) %>%
+    pivot_wider(names_from = outlet_label, values_from = point_estimate, values_fill = NA) %>%
+    mutate(across(where(is.numeric), ~round(., 1)))
+  
+  table_output <- knitr::kable(stockout_matrix, format = "markdown",
+                              caption = "Percentage of Outlets Reporting Stockout (%)")
+  cat(table_output, sep = "\n")
+  cat("\n")
+  
+  # Add footnote
+  cat("\n**Footnote:**\n\n")
+  cat("*", overall_footnote, "*\n\n")
+  
+} else {
+  cat("**No national level data available**\n\n")
+}
+```
+
+`r if(has_strata1) "### Table 2: Strata1 Level Results"`
+
+```{r table_strata1_stockouts, results='asis'}
+if ("strata1" %in% names(results_list) && nrow(results_list[["strata1"]]) > 0) {
+  
+  for (strata_val in strata_info$strata1$values) {
+    cat("\n#### ", strata_val, "\n\n")
+    
+    strata_data <- results_list[["strata1"]] %>%
+      filter(strata1 == strata_val)
+    
+    if (nrow(strata_data) > 0) {
+      stockout_matrix <- strata_data %>%
+        select(antimalarial_label, outlet_label, point_estimate) %>%
+        pivot_wider(names_from = outlet_label, values_from = point_estimate, values_fill = NA) %>%
+        mutate(across(where(is.numeric), ~round(., 1)))
+      
+      table_output <- knitr::kable(stockout_matrix, format = "markdown",
+                                  caption = paste("Percentage Reporting Stockout (%) -", strata_val))
+      cat(table_output, sep = "\n")
+      cat("\n")
+    }
+  }
+}
+```
+
+\newpage
+
+## Technical Notes
+
+**Survey Design:** Complex sampling with outlet weights (`wt_alloutlet`), cluster sampling (c4), stratification (strata1), and finite population correction (fpc).
+
+**Population Filter:** Analysis limited to:  
+- Screened outlets (`screened == 1`)  
+- Outlets with stockout data available (`a16` not missing)
+
+**Data Source:** Outlet data (`${country}_${year}_outlet_data`)
+
+**Outcome Measure:** Percentage of outlets reporting stockout for each product type
+
+**Stockout Variables Analyzed:**
+
+The analysis includes all stockout indicator variables (prefix `so_*`) found in the outlet data:
+- `so_any`: Any stockout reported (created from `a16 == 1`)
+- `so_act`: ACT stockout
+- `so_al`: Artemether-lumefantrine stockout
+- `so_asaq`: Artesunate-amodiaquine stockout
+- `so_dhappq`: Dihydroartemisinin-piperaquine stockout
+- `so_cq`: Chloroquine stockout
+- `so_qn`: Quinine stockout
+- `so_sp`: Sulfadoxine-pyrimethamine stockout
+- `so_rdt`: RDT stockout
+- Other antimalarial product stockouts as available
+
+**Statistical Method:** Survey-weighted proportions with 95% confidence intervals using the `srvyr` package. When no outlets report a stockout for a specific product/outlet combination, the proportion is recorded as 0% with CI marked as missing.
+
+**Results Structure:**  
+- **National:** Overall stockout prevalence across all outlet types
+- **Strata1:** Stockout prevalence by primary stratification variable (if present and varies)  
+- **Strata2:** Stockout prevalence by secondary stratification variable (if present and varies)  
+- **Cross-stratification:** Stockout prevalence by strata2 within each level of strata1 (if both strata present)  
+
+**Flexible Stratification:** This R version:  
+- Uses generic `strata1` and `strata2` variable names  
+- Automatically detects available strata values  
+- Adapts to whatever stratification structure exists in your data  
+- Works with any stratification scheme (e.g., region, province, urban/rural)  
+
+**Excel Output:** Results exported to Excel workbook with separate sheets for each analysis level. Each stockout type generates its own set of results across outlet types. Percentages appear as "Point Estimate" and 95% CIs as "Lower CI"/"Upper CI".
+
+**Footnotes:** Include:
+1. Count of screened outlets with stockout data for each outlet type
+2. Count of outlets that met screening criteria but didn't complete full interview
+
+**Data Standardization:** Results use common column structure (`stockout_type`, `antimalarial_label`, `outlet_type`, `point_estimate`, `lower_ci`, `upper_ci`) where:  
+- `point_estimate` = percentage of outlets reporting stockout
+- `lower_ci` = lower bound of 95% CI
+- `upper_ci` = upper bound of 95% CI  
+- Note: `antimalarial_label` is used for consistency with Excel output function, but contains stockout type labels
+
+**Key Differences from Availability Indicators:**  
+- Stockouts measure **absence** of products (supply chain failure)
+- Availability measures **presence** of products (market coverage)
+- Both use outlet-level data and survey-weighted proportions
+- Stockouts focus on outlets that **normally stock** these products but currently lack them
+
+**Interpretation Notes:**
+- High stockout rates indicate supply chain challenges
+- Stockouts may be temporary (within last X days/weeks as defined by survey instrument)
+- Stockout patterns may vary by season, region, or outlet type
+- Zero stockouts (0%) are valid results when no outlets report that specific stockout
+
+**Survey Design Notes:**
+- Uses `options(survey.lonely.psu = "adjust")` to handle strata with single PSUs
+- Includes error handling for stockout/outlet combinations with insufficient clusters
+- Records 0% stockout when no outlets report that stockout type (different from missing data)
+
+---
+
+**Report generated:** `r format(Sys.time(), '%B %d, %Y at %I:%M %p')`

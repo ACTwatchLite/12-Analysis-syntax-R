@@ -1,0 +1,768 @@
+---
+title: "ACTwatch Indicator 5.3a - Sales Price of Tests to Customers (USD)"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output: 
+  word_document:
+    toc: false
+    toc_depth: 2
+    reference_docx: null
+---
+
+## Indicator Definition
+
+**Indicator Group:** Price - Sales price of diagnostic tests to customers
+
+**Description:** The median sales price of malaria diagnostic tests (microscopy and RDTs), measured in USD, by test type, patient type (adult/child), service type (in outlet/take away), and outlet type
+
+**Numerator:** Median price (USD) for a specific diagnostic test product/service
+
+**Denominator:** All diagnostic test products with price data available for that product/service
+
+**Disaggregation:** By test type (microscopy, RDT), patient type (adult, child), service type (in outlet, take away), and outlet type; additional disaggregation by strata if available
+
+**Data Source:** RDT/Diagnostics data (long format)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, 
+                      fig.width = 12, fig.height = 8)
+
+# Set survey option to handle single PSU strata
+options(survey.lonely.psu = "adjust")
+
+library(tidyverse)
+library(survey)
+library(openxlsx)
+library(forcats)
+library(here)
+library(data.table)
+
+# Set parameters
+if (!exists("country")) stop("Global variable 'country' not found")
+if (!exists("year")) stop("Global variable 'year' not found") 
+
+# Configuration matching the Stata analysis structure
+indicator_config <- list(
+  indicator_id = "5.3a",
+  title = "Sales Price of Tests to Customers (USD)", 
+  description = "Median price of malaria diagnostic tests by type, patient type, service type, and outlet",
+  
+  # Analysis settings
+  dataset = "rdt_data", # RDT/diagnostics data in long format
+  analysis_type = "price",
+  survey_weight = "wt_alloutlet", # Standard outlet weight for price analysis (lowercase)
+  population_filter = quote(countprod == 1), # Counted products
+  
+  # Outlet types (matching Stata outvars1)
+  outlet_dummies = c("private_nonprofit", "private_forprofit", "pharmacy",
+                    "laboratory", "drug_store", "total_informal", "total_retail", 
+                    "wholesale"),
+  outlet_labels = list(
+    "private_nonprofit" = "Private Not-for-Profit",
+    "private_forprofit" = "Private For-Profit", 
+    "pharmacy" = "Pharmacy",
+    "laboratory" = "Laboratory", 
+    "drug_store" = "Drug Store",
+    "total_informal" = "Informal (Total)",
+    "total_retail" = "Retail (Total)",
+    "wholesale" = "Wholesaler"
+  ),
+
+  # Test types and their associated price variables (USD)
+  test_configs = list(
+    microscopy_adult = list(
+      test_type = "microscopy",
+      test_var = "st_micro",
+      price_var = "uspptestadulttotaldc",
+      label = "Adult microscopy",
+      short_label = "mic_ad"
+    ),
+    microscopy_child = list(
+      test_type = "microscopy",
+      test_var = "st_micro",
+      price_var = "uspptestchildtotaldc",
+      label = "Child microscopy",
+      short_label = "mic_ch"
+    ),
+    rdt_adult_outlet = list(
+      test_type = "rdt",
+      test_var = "rdt_true",
+      price_var = "uspprdtadultoutletdc",
+      label = "Adult RDT in outlet",
+      short_label = "rdt_ad_in"
+    ),
+    rdt_adult_away = list(
+      test_type = "rdt",
+      test_var = "rdt_true",
+      price_var = "uspprdtadultawaydc",
+      label = "Adult RDT take away",
+      short_label = "rdt_ad_ta"
+    )
+  ),
+  
+  # Output settings
+  file_suffix = "Sales price of tests to customers-USD"
+)
+
+# Source the create_excel_function (if available)
+excel_function_path <- here("Scripts", "3_Analysis", "create_excel_function.R")
+if (file.exists(excel_function_path)) {
+  source(excel_function_path)
+}
+```
+
+```{r load_data, include=FALSE}
+# Load RDT/diagnostics data (long format)
+data_file <- here("Data", "Final data", 
+                  paste0(country, "_", year, "_rdt_data.csv"))
+
+if (!file.exists(data_file)) {
+  stop("Data file not found: ", data_file)
+}
+
+diagnostics_data <- fread(data_file) %>%
+  # Convert all variable names to lowercase for consistency
+  rename_with(tolower) %>%
+  # Ensure strata variables are character
+  mutate(across(any_of(c("strata1", "strata2")), as.character)) %>%
+  # Clean up blank but non-missing strata values
+  mutate(
+    strata1 = dplyr::na_if(strata1, ""),
+    strata2 = dplyr::na_if(strata2, "")
+  ) %>%
+  # Drop if outlet category information is missing (following Stata logic)
+  filter(!is.na(outcat2))
+```
+
+```{r data_processing, include=FALSE}
+# Following Stata logic: ensure outlet variables are coded as 0/1
+available_outlet_vars <- intersect(indicator_config$outlet_dummies, names(diagnostics_data))
+
+# Recode outlet variables (following Stata: recode `x'(.=0) if countprod==1)
+diagnostics_data <- diagnostics_data %>%
+  mutate(
+    across(all_of(available_outlet_vars), 
+           ~ifelse(is.na(.) & countprod == 1, 0, .))
+  )
+
+# Apply population filter (counted products)
+base_data <- diagnostics_data %>%
+  filter(!!indicator_config$population_filter)
+
+# Detect strata structure
+strata_info <- list()
+if ("strata1" %in% names(base_data) && 
+    length(unique(na.omit(base_data$strata1))) > 1) {
+  strata1_values <- unique(na.omit(base_data$strata1))
+  strata1_values <- strata1_values[strata1_values != "" & !is.na(trimws(strata1_values))]
+  if (length(strata1_values) > 1) {
+    strata_info$strata1 <- list(variable = "strata1", values = strata1_values)
+  }
+}
+
+if ("strata2" %in% names(base_data) && 
+    length(unique(na.omit(base_data$strata2))) > 1) {
+  strata2_values <- unique(na.omit(base_data$strata2))
+  strata2_values <- strata2_values[strata2_values != "" & !is.na(trimws(strata2_values))]
+  if (length(strata2_values) > 1) {
+    strata_info$strata2 <- list(variable = "strata2", values = strata2_values)
+  }
+}
+
+has_strata1 <- "strata1" %in% names(strata_info)
+has_strata2 <- "strata2" %in% names(strata_info)
+cross_strata_possible <- has_strata1 && has_strata2
+```
+
+```{r analysis_function, include=FALSE}
+# Function to analyze prices for a specific test type
+analyze_test_prices <- function(data, test_config, outlet_vars, survey_weight, 
+                               strata_var = NULL, strata_values = NULL) {
+  
+  test_var <- test_config$test_var
+  price_var <- test_config$price_var
+  
+  # Check if variables exist
+  if (!test_var %in% names(data)) {
+    warning(paste("Test variable", test_var, "not found"))
+    return(NULL)
+  }
+  if (!price_var %in% names(data)) {
+    warning(paste("Price variable", price_var, "not found"))
+    return(NULL)
+  }
+  
+  # Filter for this test type and non-missing prices
+  test_data <- data %>%
+    filter(!!sym(test_var) == 1 & !is.na(!!sym(price_var)))
+  
+  if (nrow(test_data) == 0) {
+    return(NULL)
+  }
+  
+  # Apply strata filter if specified
+  if (!is.null(strata_var) && !is.null(strata_values)) {
+    if (length(strata_values) == 1) {
+      test_data <- test_data %>%
+        filter(!!sym(strata_var) == strata_values)
+    }
+  }
+  
+  if (nrow(test_data) == 0) {
+    return(NULL)
+  }
+  
+  # Setup survey design with error handling for single PSU
+  test_data_filtered <- test_data %>%
+    filter(!is.na(!!sym(survey_weight)))
+  
+  # Check if we have enough PSUs for survey design
+  n_psu <- test_data_filtered %>% 
+    summarise(n_psu = n_distinct(c4, na.rm = TRUE)) %>% 
+    pull(n_psu)
+  
+  if (n_psu < 2) {
+    message(paste("Skipping", test_config$label, "- insufficient PSUs (n =", n_psu, ")"))
+    return(NULL)
+  }
+  
+  survey_design <- tryCatch({
+    test_data_filtered %>%
+      as_survey_design(
+        ids = c4,
+        weights = !!sym(survey_weight),
+        strata = strata1,
+        fpc = fpc
+      )
+  }, error = function(e) {
+    message(paste("Error creating survey design for", test_config$label, ":", e$message))
+    return(NULL)
+  })
+  
+  if (is.null(survey_design)) {
+    return(NULL)
+  }
+  
+  results <- tibble()
+  
+  # Calculate prices for each outlet type
+  for (outlet in outlet_vars) {
+    if (!outlet %in% names(test_data)) next
+    
+    outlet_data <- survey_design %>%
+      filter(!!sym(outlet) == 1)
+    
+    if (nrow(outlet_data) == 0) next
+    
+    # Calculate weighted percentiles
+    tryCatch({
+      # Try using statar package if available
+      if (requireNamespace("statar", quietly = TRUE)) {
+        pctiles <- outlet_data %>%
+          summarise(
+            q25 = statar::pctile(!!sym(price_var), probs = 0.25, w = !!sym(survey_weight)),
+            q50 = statar::pctile(!!sym(price_var), probs = 0.50, w = !!sym(survey_weight)),
+            q75 = statar::pctile(!!sym(price_var), probs = 0.75, w = !!sym(survey_weight)),
+            n = n()
+          )
+      } else {
+        # Fallback to survey package
+        pctiles <- tibble(
+          q25 = as.numeric(svyquantile(as.formula(paste0("~", price_var)), 
+                                       outlet_data, quantiles = 0.25, na.rm = TRUE)),
+          q50 = as.numeric(svyquantile(as.formula(paste0("~", price_var)), 
+                                       outlet_data, quantiles = 0.50, na.rm = TRUE)),
+          q75 = as.numeric(svyquantile(as.formula(paste0("~", price_var)), 
+                                       outlet_data, quantiles = 0.75, na.rm = TRUE)),
+          n = nrow(outlet_data)
+        )
+      }
+      
+      result_row <- tibble(
+        test_type = test_config$test_type,
+        test_label = test_config$label,
+        outlet_type = outlet,
+        outlet_label = indicator_config$outlet_labels[[outlet]] %||% outlet,
+        point_estimate = pctiles$q50,
+        lower_ci = pctiles$q25,
+        upper_ci = pctiles$q75,
+        sample_size = pctiles$n
+      )
+      
+      if (!is.null(strata_var)) {
+        if (length(strata_values) == 1) {
+          result_row[[strata_var]] <- strata_values
+        }
+      }
+      
+      results <- bind_rows(results, result_row)
+    }, error = function(e) {
+      message(paste("Error calculating percentiles for", outlet, ":", e$message))
+    })
+  }
+  
+  return(results)
+}
+
+# Function to calculate footnotes (missing price counts)
+calculate_footnotes <- function(data, test_config) {
+  test_var <- test_config$test_var
+  price_var <- test_config$price_var
+  
+  if (!test_var %in% names(data) || !price_var %in% names(data)) {
+    return("Price variable not available")
+  }
+  
+  missing_count <- data %>%
+    filter(!!sym(test_var) == 1 & is.na(!!sym(price_var))) %>%
+    nrow()
+  
+  paste0("Products with missing price data for ", test_config$label, ": ", missing_count)
+}
+```
+
+```{r run_analysis, include=FALSE}
+# Initialize results storage
+results_list <- list()
+footnotes_list <- list()
+
+# Analyze each test type
+for (test_name in names(indicator_config$test_configs)) {
+  test_config <- indicator_config$test_configs[[test_name]]
+  
+  # National level
+  national_results <- analyze_test_prices(
+    base_data, test_config, available_outlet_vars, indicator_config$survey_weight
+  )
+  
+  if (!is.null(national_results) && nrow(national_results) > 0) {
+    if (!"national" %in% names(results_list)) {
+      results_list[["national"]] <- tibble()
+    }
+    results_list[["national"]] <- bind_rows(results_list[["national"]], national_results)
+    
+    footnote <- calculate_footnotes(base_data, test_config)
+    footnotes_list[[paste0("national_", test_name)]] <- footnote
+  }
+  
+  # Strata1 level
+  if (has_strata1) {
+    for (strata_val in strata_info$strata1$values) {
+      strata1_results <- analyze_test_prices(
+        base_data, test_config, available_outlet_vars, indicator_config$survey_weight,
+        strata_var = "strata1", strata_values = strata_val
+      )
+      
+      if (!is.null(strata1_results) && nrow(strata1_results) > 0) {
+        if (!"strata1" %in% names(results_list)) {
+          results_list[["strata1"]] <- tibble()
+        }
+        results_list[["strata1"]] <- bind_rows(results_list[["strata1"]], strata1_results)
+      }
+    }
+  }
+  
+  # Strata2 level
+  if (has_strata2) {
+    for (strata_val in strata_info$strata2$values) {
+      strata2_results <- analyze_test_prices(
+        base_data, test_config, available_outlet_vars, indicator_config$survey_weight,
+        strata_var = "strata2", strata_values = strata_val
+      )
+      
+      if (!is.null(strata2_results) && nrow(strata2_results) > 0) {
+        if (!"strata2" %in% names(results_list)) {
+          results_list[["strata2"]] <- tibble()
+        }
+        results_list[["strata2"]] <- bind_rows(results_list[["strata2"]], strata2_results)
+      }
+    }
+  }
+  
+  # Cross-stratification
+  if (cross_strata_possible) {
+    for (s1_val in strata_info$strata1$values) {
+      for (s2_val in strata_info$strata2$values) {
+        cross_data <- base_data %>%
+          filter(strata1 == s1_val & strata2 == s2_val)
+        
+        if (nrow(cross_data) > 0) {
+          cross_results <- analyze_test_prices(
+            cross_data, test_config, available_outlet_vars, indicator_config$survey_weight
+          )
+          
+          if (!is.null(cross_results) && nrow(cross_results) > 0) {
+            cross_results <- cross_results %>%
+              mutate(strata1 = s1_val, strata2 = s2_val)
+            
+            cross_name <- paste0("cross_", s1_val)
+            if (!cross_name %in% names(results_list)) {
+              results_list[[cross_name]] <- tibble()
+            }
+            results_list[[cross_name]] <- bind_rows(results_list[[cross_name]], cross_results)
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+```{r export_excel, include=FALSE}
+# Standardize column names for Excel export (rename test_label to antimalarial_label)
+results_list_excel <- lapply(results_list, function(df) {
+  if ("test_label" %in% names(df)) {
+    df %>% rename(antimalarial_label = test_label)
+  } else {
+    df
+  }
+})
+
+# Consolidate footnotes to match results_list structure
+consolidated_footnotes <- list()
+for (sheet_name in names(results_list_excel)) {
+  # Get all footnotes that match this sheet level
+  matching_footnotes <- footnotes_list[grepl(paste0("^", sheet_name, "_"), names(footnotes_list))]
+  if (length(matching_footnotes) > 0) {
+    # Combine all footnotes for this sheet
+    consolidated_footnotes[[sheet_name]] <- paste(unlist(matching_footnotes), collapse = "; ")
+  } else {
+    consolidated_footnotes[[sheet_name]] <- ""
+  }
+}
+
+# Use the standard create_excel_output function
+excel_success <- create_excel_output(
+  results_list = results_list,
+  footnotes_list = footnotes_list, 
+  indicator_config = indicator_config,
+  country = country,
+  year = year,
+  include_antimalarial_col = TRUE
+)
+
+
+if (excel_success) {
+  cat("Excel file created successfully\n")
+} else {
+  cat("Warning: Excel file creation encountered issues\n")
+}
+```
+
+\newpage
+
+## Executive Summary
+
+This indicator analyzes the median sales prices of malaria diagnostic tests (microscopy and RDTs) charged to customers in USD. The analysis covers:
+
+- **Microscopy:** Adult and child testing
+- **RDTs:** Adult in-outlet testing and take-away kits
+
+Results are disaggregated by outlet type and, where applicable, by geographic or administrative strata.
+
+**Key Findings:**
+
+```{r summary_stats, results='asis'}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Summarize by test type
+  summary_by_test <- results_list[["national"]] %>%
+    group_by(test_label) %>%
+    summarise(
+      median_price = median(point_estimate, na.rm = TRUE),
+      min_price = min(point_estimate, na.rm = TRUE),
+      max_price = max(point_estimate, na.rm = TRUE),
+      outlets_offering = n(),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(median_price))
+  
+  cat("\n**Test Price Summary:**\n\n")
+  for (i in 1:nrow(summary_by_test)) {
+    cat(paste0("- **", summary_by_test$test_label[i], ":** ", 
+               "Median = $", round(summary_by_test$median_price[i], 2),
+               " (range: $", round(summary_by_test$min_price[i], 2), 
+               " to $", round(summary_by_test$max_price[i], 2), ")\n"))
+  }
+  
+} else {
+  cat("**No national level data available**\n\n")
+}
+```
+
+\newpage
+
+## Figures
+
+### Figure 1: Test Prices by Test Type (National Level)
+
+```{r figure_national_prices, fig.width=12, fig.height=8}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Calculate median across outlets for each test type
+  national_test_prices <- results_list[["national"]] %>%
+    group_by(test_label) %>%
+    summarise(
+      median_price = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      q25 = weighted.mean(lower_ci, sample_size, na.rm = TRUE),
+      q75 = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(national_test_prices) > 0) {
+    ggplot(national_test_prices, aes(x = reorder(test_label, median_price), 
+                                     y = median_price)) +
+      geom_col(fill = "#2171b5", alpha = 0.8) +
+      geom_errorbar(aes(ymin = q25, ymax = q75), width = 0.3) +
+      coord_flip() +
+      labs(
+        title = "Median Diagnostic Test Prices by Test Type (National Level)",
+        x = "Test Type",
+        y = "Median Price (USD)",
+        caption = "Error bars show interquartile range (Q25-Q75)"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        axis.text = element_text(size = 12)
+      ) +
+      scale_y_continuous(labels = scales::dollar_format(),
+                        expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+### Figure 2: Test Prices by Outlet Type (National Level)
+
+```{r figure_outlet_prices, fig.width=12, fig.height=10}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  ggplot(results_list[["national"]], 
+         aes(x = fct_reorder(outlet_label, point_estimate), 
+             y = point_estimate, fill = test_label)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), 
+                  position = position_dodge(width = 0.9), width = 0.2) +
+    coord_flip() +
+    labs(
+      title = "Median Test Prices by Outlet Type and Test Type",
+      x = "Outlet Type",
+      y = "Median Price (USD)",
+      fill = "Test Type",
+      caption = "Error bars show interquartile range (Q25-Q75)"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom",
+      legend.text = element_text(size = 10)
+    ) +
+    scale_fill_brewer(type = "qual", palette = "Set2") +
+    scale_y_continuous(labels = scales::dollar_format(),
+                      expand = expansion(mult = c(0, 0.15))) +
+    guides(fill = guide_legend(ncol = 2))
+}
+```
+
+`r if(has_strata1) "### Figure 3: Test Prices by Test Type and Strata1"`
+
+```{r figure_test_prices_strata1, fig.width=12, fig.height=8}
+if ("strata1" %in% names(results_list) && nrow(results_list[["strata1"]]) > 0) {
+  
+  strata1_test_prices <- results_list[["strata1"]] %>%
+    group_by(test_label, strata1) %>%
+    summarise(
+      median_price = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      q25 = weighted.mean(lower_ci, sample_size, na.rm = TRUE),
+      q75 = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(strata1_test_prices) > 0) {
+    ggplot(strata1_test_prices, aes(x = reorder(test_label, median_price), 
+                                    y = median_price, fill = strata1)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = q25, ymax = q75), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      coord_flip() +
+      labs(
+        title = "Median Test Prices by Test Type and Strata1",
+        x = "Test Type",
+        y = "Median Price (USD)",
+        fill = "Strata1",
+        caption = "Error bars show interquartile range (Q25-Q75)"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+      ) +
+      scale_fill_brewer(type = "qual", palette = "Set1") +
+      scale_y_continuous(labels = scales::dollar_format(),
+                        expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+`r if(has_strata2) "### Figure 4: Test Prices by Test Type and Strata2"`
+
+```{r figure_test_prices_strata2, fig.width=12, fig.height=8}
+if ("strata2" %in% names(results_list) && nrow(results_list[["strata2"]]) > 0) {
+  
+  strata2_test_prices <- results_list[["strata2"]] %>%
+    group_by(test_label, strata2) %>%
+    summarise(
+      median_price = weighted.mean(point_estimate, sample_size, na.rm = TRUE),
+      q25 = weighted.mean(lower_ci, sample_size, na.rm = TRUE),
+      q75 = weighted.mean(upper_ci, sample_size, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  if (nrow(strata2_test_prices) > 0) {
+    ggplot(strata2_test_prices, aes(x = reorder(test_label, median_price), 
+                                    y = median_price, fill = strata2)) +
+      geom_col(position = "dodge", alpha = 0.8) +
+      geom_errorbar(aes(ymin = q25, ymax = q75), 
+                    position = position_dodge(width = 0.9), width = 0.2) +
+      coord_flip() +
+      labs(
+        title = "Median Test Prices by Test Type and Strata2",
+        x = "Test Type",
+        y = "Median Price (USD)",
+        fill = "Strata2",
+        caption = "Error bars show interquartile range (Q25-Q75)"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+      ) +
+      scale_fill_brewer(type = "qual", palette = "Set2") +
+      scale_y_continuous(labels = scales::dollar_format(),
+                        expand = expansion(mult = c(0, 0.15)))
+  }
+}
+```
+
+\newpage
+
+## Tables
+
+### Table 1: National Level Results - Prices by Test Type × Outlet Matrix
+
+```{r table_national_price, results='asis'}
+if ("national" %in% names(results_list) && nrow(results_list[["national"]]) > 0) {
+  
+  # Create comprehensive table with median prices as values
+  price_matrix <- results_list[["national"]] %>%
+    select(test_label, outlet_label, point_estimate) %>%
+    pivot_wider(names_from = outlet_label, values_from = point_estimate, values_fill = NA) %>%
+    mutate(across(where(is.numeric), ~round(., 2)))
+  
+  table_output <- knitr::kable(price_matrix, format = "markdown",
+                              caption = "Median Price (USD)")
+  cat(table_output, sep = "\n")
+  cat("\n")
+  
+  # Add footnotes
+  if (length(footnotes_list) > 0) {
+    cat("\n**Footnotes:**\n\n")
+    for (fn_name in names(footnotes_list)) {
+      if (grepl("^national_", fn_name)) {
+        cat("*", footnotes_list[[fn_name]], "*\n\n")
+      }
+    }
+  }
+  
+} else {
+  cat("**No national level data available**\n\n")
+}
+```
+
+`r if(has_strata1) "### Table 2: Strata1 Level Results"`
+
+```{r table_strata1_price, results='asis'}
+if ("strata1" %in% names(results_list) && nrow(results_list[["strata1"]]) > 0) {
+  
+  for (strata_val in strata_info$strata1$values) {
+    cat("\n#### ", strata_val, "\n\n")
+    
+    strata_data <- results_list[["strata1"]] %>%
+      filter(strata1 == strata_val)
+    
+    if (nrow(strata_data) > 0) {
+      price_matrix <- strata_data %>%
+        select(test_label, outlet_label, point_estimate) %>%
+        pivot_wider(names_from = outlet_label, values_from = point_estimate, values_fill = NA) %>%
+        mutate(across(where(is.numeric), ~round(., 2)))
+      
+      table_output <- knitr::kable(price_matrix, format = "markdown",
+                                  caption = paste("Median Price (USD) -", strata_val))
+      cat(table_output, sep = "\n")
+      cat("\n")
+    }
+  }
+}
+```
+
+\newpage
+
+## Technical Notes
+
+**Survey Design:** Complex sampling with outlet weights (`wt_alloutlet`), cluster sampling (c4), stratification (strata1), and finite population correction (fpc).
+
+**Population Filter:** Analysis limited to:  
+- Counted products (`countprod == 1`)  
+- Products with non-missing price data  
+
+**Data Source:** RDT/Diagnostics data (`${country}_${year}_rdt_data`)
+
+**Test Types Analyzed (USD prices):**
+
+1. **Microscopy:**
+   - Adult microscopy (`uspptestadulttotaldc`)
+   - Child microscopy (`uspptestchildtotaldc`)
+
+2. **Rapid Diagnostic Tests (RDTs):**
+   - Adult RDT in outlet (`uspprdtadultoutletdc`)
+   - Adult RDT take away (`uspprdtadultawaydc`)
+
+**Statistical Method:** Survey-weighted quantiles (25th, 50th, and 75th percentiles) using `statar::pctile()` for weighted percentiles, with fallback to `survey` package's `svyquantile()`.
+
+**Results Structure:**  
+- **National:** Overall price medians across all outlets with price data for each test type
+- **Strata1:** Price medians by primary stratification variable (if present and varies)  
+- **Strata2:** Price medians by secondary stratification variable (if present and varies)  
+- **Cross-stratification:** Price medians by strata2 within each level of strata1 (if both strata present)  
+
+**Flexible Stratification:** Unlike the original Stata code which hardcoded urban/rural categories, this R version:  
+- Uses generic `strata1` and `strata2` variable names  
+- Automatically detects available strata values  
+- Adapts to whatever stratification structure exists in your data  
+- Works with any stratification scheme (e.g., region, province, urban/rural)  
+
+**Excel Output:** Results exported to Excel workbook with separate sheets for each analysis level. Each test type generates its own set of results across outlet types. Median prices appear as "Point Estimate" and quartiles as "Lower CI"/"Upper CI" for consistency with other indicators.
+
+**Footnotes:** Include counts of diagnostic test products audited but missing price information, calculated separately for each test type.
+
+**Data Standardization:** Results use common column structure (`test_type`, `test_label`, `outlet_type`, `point_estimate`, `lower_ci`, `upper_ci`) where:  
+- `point_estimate` = median price (USD)  
+- `lower_ci` = 25th percentile (Q25)  
+- `upper_ci` = 75th percentile (Q75)  
+
+**Key Differences from Indicators 5.1a and 5.2a:**  
+- Analysis focuses on **diagnostic tests** rather than antimalarial drugs  
+- Multiple price variables analyzed (4 test types vs single price per product)  
+- Uses RDT/diagnostics dataset instead of product dataset  
+- Separate analysis for each test type (adult/child, microscopy/RDT, in-outlet/take-away)  
+- Results organized by test type rather than by antimalarial product  
+- **All prices measured in USD** (using variables with "usp" prefix and "DC" suffix)
+- Matches Stata file: `5_3a_Sales_price_of_tests_to_customer_-_USD.do`
+
+**Survey Design Notes:**
+- Uses `options(survey.lonely.psu = "adjust")` to handle strata with single PSUs
+- Includes error handling for test/outlet combinations with insufficient clusters
+- Skips combinations that cannot support variance estimation
+
+---
+
+**Report generated:** `r format(Sys.time(), '%B %d, %Y at %I:%M %p')`
